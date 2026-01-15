@@ -38,7 +38,7 @@ PI_COL_NAME = "Project Principal Investigator"
 PROJECT_COL_NAME = "Project Number"
 TASK_NAME_COL_NAME = "Task Name"
 TASK_NUMBER_COL_NAME = "Task Number"
-STATUS_COL_NAME = "Task Status"
+STATUS_COL_NAME = "Project Status"
 
 ALLOC_BUDGET_NET_COL = "Allocated Budget*"
 CURRENT_BAL_NET_COL = "Current Balance*"
@@ -289,7 +289,7 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
 st.markdown(
     """
     <div style="padding: 1rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 1rem;">
-      <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Summary (Per-PI ZIP)</div>
+      <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
       <div style="opacity: 0.85; margin-top: 0.25rem;">
         Preview both files, choose merge columns, validate match rate, then download one ZIP with one Excel file per PI.
       </div>
@@ -406,7 +406,7 @@ if master_file and award_file:
                 st.code(", ".join(missing[:40]))
 
         st.markdown("---")
-        st.markdown("### Generate Per-PI ZIP")
+        st.markdown("### Generate Monthly Reports")
 
         if st.button("Generate ZIP (one Excel per PI)", type="primary"):
             df_work_full = df_master_view.copy()
