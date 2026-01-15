@@ -31,7 +31,7 @@ TASK_NUMBER_COL_NAME = "Task Number"
 STATUS_COL_NAME = "Task Status"
 OWNING_ORG_COL_NAME = "Project Owning Organization"
 
-# Award Info columns (THIS is your confirmed synonym)
+# Award Info columns (confirmed)
 AWARD_INFO_PROJECT_COL = "AGGIE ENTERPRISE PROJECT #"
 AWARD_INFO_INDIRECT_COL = "INDIRECT RATE"
 
@@ -79,13 +79,11 @@ def find_project_number_column(columns):
       - Project ID
       - Project No
     """
-    # try exact/keyword first
     try:
         return find_column_by_exact_or_keywords(columns, PROJECT_COL_NAME, keywords=["project", "number"])
     except KeyError:
         pass
 
-    # heuristic candidates
     candidates = []
     for c in columns:
         low = c.lower()
@@ -113,25 +111,38 @@ def canon_project_key(x) -> str:
     """
     Canonicalize project identifiers so Aggie Enterprise + Award Info match.
 
-    Handles common messiness:
-      - numeric IDs stored as floats: 12345.0 -> "12345"
-      - strings with whitespace: " 12345 " -> "12345"
-      - NaN -> ""
+    Strategy:
+      - Trim / normalize whitespace
+      - If numeric-like (e.g., 12345.0), convert to integer string "12345"
+      - Otherwise, extract FIRST digit-run (e.g., 'AE Project 0012345' -> '12345')
+      - Fall back to alphanumeric-only cleaned string
     """
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return ""
+
     s = str(x).replace("\xa0", " ").strip()
     if not s:
         return ""
 
-    # If it looks numeric, normalize 12345.0 -> 12345
+    # numeric-like? normalize 12345.0 -> 12345
     try:
         f = float(s)
         if f.is_integer():
             return str(int(f))
-        return s
     except ValueError:
-        return s
+        pass
+
+    # extract digit run
+    m = re.search(r"(\d+)", s)
+    if m:
+        digits = m.group(1)
+        try:
+            return str(int(digits))  # strips leading zeros
+        except ValueError:
+            return digits
+
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", s)
+    return cleaned
 
 
 def make_safe_filename_fragment(name: str) -> str:
@@ -144,11 +155,7 @@ def make_safe_filename_fragment(name: str) -> str:
 
 
 def normalize_pi_name(pi: str) -> str:
-    """
-    Normalize PI names to 'Last, First ...' form.
-    - 'Yuko Munakata' -> 'Munakata, Yuko'
-    - 'Munakata, Yuko' -> unchanged
-    """
+    """Normalize PI names to 'Last, First' form."""
     pi = str(pi).replace("\xa0", " ").strip()
     if not pi:
         return "Unknown PI"
@@ -269,7 +276,7 @@ def style_sheet(workbook, sheet_name, currency_cols, footnote_text, hide_indirec
     ws[f"A{footer_row}"].font = Font(italic=True, size=10)
 
 
-def build_zip_by_org7_and_pi(df_merged, base_name, currency_cols, footnote_text):
+def build_zip_by_org7_and_pi(df_merged, base_name, currency_cols, footnote_text, hide_indirect=True):
     """
     ZIP structure:
       <Org7>/<Report Label> - <Last, First>.xlsx
@@ -278,9 +285,6 @@ def build_zip_by_org7_and_pi(df_merged, base_name, currency_cols, footnote_text)
     used_paths = set()
 
     report_label = base_name.replace("_", " ").strip()
-
-    if "_PI_stripped" not in df_merged.columns or "_Org7" not in df_merged.columns:
-        raise ValueError("Missing helper columns '_PI_stripped' and/or '_Org7' for ZIP creation.")
 
     grouped = df_merged.groupby(["_Org7", "_PI_stripped"], sort=True)
 
@@ -313,7 +317,7 @@ def build_zip_by_org7_and_pi(df_merged, base_name, currency_cols, footnote_text)
             with pd.ExcelWriter(pi_buf, engine="openpyxl") as writer:
                 out.to_excel(writer, index=False, sheet_name="Budget Summary")
                 wb = writer.book
-                style_sheet(wb, "Budget Summary", currency_cols, footnote_text, hide_indirect=True)
+                style_sheet(wb, "Budget Summary", currency_cols, footnote_text, hide_indirect=hide_indirect)
             pi_buf.seek(0)
 
             zf.writestr(zip_path, pi_buf.read())
@@ -325,7 +329,14 @@ def build_zip_by_org7_and_pi(df_merged, base_name, currency_cols, footnote_text)
 # -----------------------------
 # Processing (byte-safe for Streamlit Cloud)
 # -----------------------------
-def process_workbooks_bytes(master_bytes, award_bytes_list, date_pulled="", pi_filter="", org7_filter=""):
+def process_workbooks_bytes(
+    master_bytes,
+    award_bytes_list,
+    date_pulled="",
+    pi_filter="",
+    org7_filter="",
+    show_merge_diagnostics=False,
+):
     base_name = "Budget_Report"
     prefix = (date_pulled or "").strip()
     if prefix:
@@ -384,15 +395,13 @@ def process_workbooks_bytes(master_bytes, award_bytes_list, date_pulled="", pi_f
     needed_cols = [c for c in needed_cols if c in df_active.columns]
     df_active = df_active[needed_cols].copy()
 
-    # ---- Build canonical project key for merge BEFORE mutating the Project Number ----
+    # ---- Build canonical project key for merge BEFORE mutating the Project Number display ----
     df_active["_proj_key"] = df_active[project_col].apply(canon_project_key)
 
-    # Combine Project Number + Task Number into the displayed Project Number column
-    df_active[project_col] = (
-        df_active[project_col].astype("Int64").astype(str).replace("<NA>", "").str.strip()
-        + "-"
-        + df_active[task_number_col].astype("Int64").astype(str).replace("<NA>", "").str.strip()
-    ).str.strip("-")
+    # Combine Project Number + Task Number into the displayed Project Number column (safe string approach)
+    p = df_active[project_col].astype(str).replace("nan", "").str.replace(".0", "", regex=False).str.strip()
+    t = df_active[task_number_col].astype(str).replace("nan", "").str.replace(".0", "", regex=False).str.strip()
+    df_active[project_col] = (p + "-" + t).str.strip("-")
 
     # Combine Project Name + Task Name into Project Name
     if "Project Name" in df_active.columns:
@@ -440,11 +449,30 @@ def process_workbooks_bytes(master_bytes, award_bytes_list, date_pulled="", pi_f
         award_df[["_proj_key", AWARD_INFO_INDIRECT_COL]],
         on="_proj_key",
         how="left",
-    ).drop(columns=["_proj_key"], errors="ignore")
+    )
 
     df_merged = df_merged.rename(columns={AWARD_INFO_INDIRECT_COL: "Indirect Rate"})
 
-    # Compute net-of-indirect columns
+    # ---- DIAGNOSTICS: validate merge success ----
+    matched = df_merged["Indirect Rate"].notna().sum()
+    total = len(df_merged)
+    match_rate = matched / total if total else 0.0
+
+    if show_merge_diagnostics:
+        st.write(f"🔎 Award merge match rate: {matched}/{total} ({match_rate:.1%})")
+        if match_rate < 0.90:
+            st.warning("Low match rate between Aggie Enterprise and Award Info project keys.")
+            st.write("Sample master _proj_key values:")
+            st.write(df_active["_proj_key"].dropna().astype(str).unique()[:15])
+            st.write("Sample award _proj_key values:")
+            st.write(award_df["_proj_key"].dropna().astype(str).unique()[:15])
+            st.write("Examples of rows with missing Indirect Rate (first 20):")
+            st.dataframe(df_merged[df_merged["Indirect Rate"].isna()].head(20))
+
+    # Keep helper merge key only for debugging, then drop
+    df_merged = df_merged.drop(columns=["_proj_key"], errors="ignore")
+
+    # Compute net-of-indirect columns (treat missing indirect as 0.0)
     df_merged["Indirect Rate"] = pd.to_numeric(df_merged["Indirect Rate"], errors="coerce").fillna(0.0)
     df_merged["Allocated Budget"] = pd.to_numeric(df_merged["Allocated Budget"], errors="coerce")
     df_merged["Current Balance"] = pd.to_numeric(df_merged["Current Balance"], errors="coerce")
@@ -477,7 +505,7 @@ def process_workbooks_bytes(master_bytes, award_bytes_list, date_pulled="", pi_f
     if prefix:
         df_merged["Date Pulled"] = prefix
 
-    # Optional filters (simple substring match for PI; exact match for Org7)
+    # Optional filters (substring for PI; exact for Org7)
     pi_query = (pi_filter or "").strip().lower()
     org_query = (org7_filter or "").strip().upper()
 
@@ -499,7 +527,15 @@ def process_workbooks_bytes(master_bytes, award_bytes_list, date_pulled="", pi_f
         footnote_text = "* Calculated minus the indirect costs (Indirect Rate varies by project)."
 
     currency_cols = [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"]
-    zip_bytes = build_zip_by_org7_and_pi(df_merged, base_name, currency_cols, footnote_text)
+
+    # Build ZIP (PI-facing: hide Indirect Rate column by default)
+    zip_bytes = build_zip_by_org7_and_pi(
+        df_merged,
+        base_name,
+        currency_cols,
+        footnote_text,
+        hide_indirect=True,
+    )
 
     summary = {
         "base_name": base_name,
@@ -508,13 +544,23 @@ def process_workbooks_bytes(master_bytes, award_bytes_list, date_pulled="", pi_f
         "num_pis": int(df_merged["_PI_stripped"].nunique(dropna=True)),
         "num_org7": int(df_merged["_Org7"].nunique(dropna=True)),
         "org7_examples": [str(x) for x in df_merged["_Org7"].dropna().unique()[:8]],
+        "merge_match_rate": match_rate,
+        "merge_matched_rows": int(matched),
+        "merge_total_rows": int(total),
     }
     return base_name, zip_bytes, summary
 
 
 @st.cache_data(show_spinner=False)
-def process_workbooks_cached(master_bytes, award_bytes_list, date_pulled, pi_filter, org7_filter):
-    return process_workbooks_bytes(master_bytes, award_bytes_list, date_pulled, pi_filter, org7_filter)
+def process_workbooks_cached(master_bytes, award_bytes_list, date_pulled, pi_filter, org7_filter, show_merge_diagnostics):
+    return process_workbooks_bytes(
+        master_bytes,
+        award_bytes_list,
+        date_pulled,
+        pi_filter,
+        org7_filter,
+        show_merge_diagnostics,
+    )
 
 
 # -----------------------------
@@ -574,6 +620,7 @@ def main():
 
     with st.expander("Debug options", expanded=False):
         show_trace = st.checkbox("Show full error trace", value=False)
+        show_merge_diagnostics = st.checkbox("Show award-merge diagnostics", value=True)
 
     st.markdown(
         """
@@ -611,7 +658,12 @@ def main():
 
                 with st.spinner("Processing files..."):
                     base_name, zip_bytes, summary = process_workbooks_cached(
-                        master_bytes, award_bytes_list, date_pulled, pi_filter_input, org_filter_input
+                        master_bytes,
+                        award_bytes_list,
+                        date_pulled,
+                        pi_filter_input,
+                        org_filter_input,
+                        show_merge_diagnostics,
                     )
 
                 st.success("Processing complete!")
@@ -624,6 +676,10 @@ def main():
                 if summary["org7_examples"]:
                     st.write("Examples of Org7 folders:")
                     st.write(", ".join(summary["org7_examples"]))
+                st.write(
+                    f"- Award merge match rate: **{summary['merge_matched_rows']}/{summary['merge_total_rows']} "
+                    f"({summary['merge_match_rate']:.1%})**"
+                )
 
                 st.download_button(
                     "Download Budget Summaries (ZIP)",
