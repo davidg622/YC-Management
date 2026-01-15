@@ -1,6 +1,7 @@
 import re
 import traceback
 from io import BytesIO
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -8,18 +9,19 @@ from openpyxl.styles import Font, PatternFill, numbers
 from openpyxl.utils import get_column_letter
 
 # ============================================================
-# Yellow Cluster: Budget Summary (Merge Debugger)
+# Yellow Cluster: Budget Summary (Merge Debugger + Per-PI ZIP)
 # - Preview both files BEFORE merge
 # - Let user SELECT merge columns for Master and Award
 # - Show match-rate diagnostics (keys overlap + unmatched samples)
-# - Generate ONE final Excel output (no PI/org sorting, no folders)
+# - Generate ONE ZIP containing ONE Excel file PER PI
+#   (no organization sorting / no folders)
 # ============================================================
 
 # -----------------------------
 # PAGE CONFIG (must be first Streamlit call)
 # -----------------------------
 st.set_page_config(
-    page_title="Yellow Cluster: Budget Summary (Merge Debugger)",
+    page_title="Yellow Cluster: Budget Summary (Per-PI ZIP)",
     page_icon="🐄",
     layout="wide",
 )
@@ -95,6 +97,28 @@ def find_column_by_exact_or_keywords(columns, target_name, keywords=None):
     )
 
 
+def normalize_pi_last_first(pi_val: str) -> str:
+    s = safe_str(pi_val)
+    if not s:
+        return ""
+    if "," in s:
+        return s
+    parts = s.split()
+    if len(parts) >= 2:
+        return f"{parts[-1]}, {' '.join(parts[:-1])}"
+    return s
+
+
+def make_safe_filename_fragment(name: str) -> str:
+    """
+    Filesystem-safe fragment for filenames.
+    """
+    frag = safe_str(name)
+    frag = re.sub(r'[\/:*?"<>|]+', "_", frag)
+    frag = frag.strip().strip(".")
+    return frag[:120] if frag else "PI"
+
+
 def apply_currency_format(wb, ws_name, columns):
     ws = wb[ws_name]
     header_row = next(ws.iter_rows(min_row=1, max_row=1))
@@ -161,7 +185,7 @@ def style_sheet(wb, ws_name, currency_cols, footnote_text, hide_indirect=True):
         for cell in col:
             if cell.value is not None:
                 max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[col_letter].width = max(10, min(max_len + 2, 50))
+        ws.column_dimensions[col_letter].width = max(10, min(max_len + 2, 55))
 
     # hide indirect if requested
     if hide_indirect and indirect_col_letter:
@@ -195,41 +219,64 @@ def read_award(award_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     return df
 
 
-def normalize_pi_last_first(pi_val: str) -> str:
-    s = safe_str(pi_val)
-    if not s:
-        return ""
-    if "," in s:
-        return s
-    parts = s.split()
-    if len(parts) >= 2:
-        return f"{parts[-1]}, {' '.join(parts[:-1])}"
-    return s
+def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_label: str) -> bytes:
+    """
+    Create one Excel file per PI and return a ZIP (bytes).
+    """
+    # Ensure PI values are normalized for grouping
+    df_out = df_out.copy()
+    df_out[pi_col] = df_out[pi_col].apply(normalize_pi_last_first)
 
+    unique_pis = [p for p in df_out[pi_col].dropna().unique().tolist() if safe_str(p)]
+    unique_pis_sorted = sorted(unique_pis, key=lambda s: safe_str(s).lower())
 
-def build_output_excel(df_out: pd.DataFrame, hide_indirect: bool) -> bytes:
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_out.to_excel(writer, index=False, sheet_name="Budget Summary")
-        wb = writer.book
+    zip_buf = BytesIO()
+    used_names = set()
 
-        # Footnote depends on whether one indirect rate dominates
-        if "Indirect Rate" in df_out.columns:
-            unique_rates = pd.Series(df_out["Indirect Rate"].dropna().unique())
-            if len(unique_rates) == 1:
-                footnote = f"* Calculated minus the indirect costs (Indirect Rate = {float(unique_rates.iloc[0]):.2%})."
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for pi in unique_pis_sorted:
+            group = df_out[df_out[pi_col] == pi].copy()
+            if group.empty:
+                continue
+
+            # Footnote per PI (if one indirect rate)
+            if "Indirect Rate" in group.columns:
+                uniq = pd.Series(group["Indirect Rate"].dropna().unique())
+                if len(uniq) == 1:
+                    footnote = f"* Calculated minus the indirect costs (Indirect Rate = {float(uniq.iloc[0]):.2%})."
+                else:
+                    footnote = "* Calculated minus the indirect costs (Indirect Rate varies by project)."
             else:
-                footnote = "* Calculated minus the indirect costs (Indirect Rate varies by project)."
-        else:
-            footnote = "* Calculated minus the indirect costs."
+                footnote = "* Calculated minus the indirect costs."
 
-        currency_cols = [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"]
-        currency_cols = [c for c in currency_cols if c in df_out.columns]
+            currency_cols = [c for c in [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"] if c in group.columns]
 
-        style_sheet(wb, "Budget Summary", currency_cols, footnote, hide_indirect=hide_indirect)
+            # Write PI workbook to bytes
+            xbuf = BytesIO()
+            with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+                group.to_excel(writer, index=False, sheet_name="Budget Summary")
+                wb = writer.book
+                style_sheet(wb, "Budget Summary", currency_cols, footnote, hide_indirect=hide_indirect)
+            xbuf.seek(0)
 
-    buf.seek(0)
-    return buf.getvalue()
+            safe_pi = make_safe_filename_fragment(pi)
+            filename = f"{report_label} - {safe_pi}.xlsx"
+
+            # avoid dup filenames
+            if filename in used_names:
+                k = 2
+                while True:
+                    candidate = f"{report_label} - {safe_pi} ({k}).xlsx"
+                    if candidate not in used_names:
+                        filename = candidate
+                        break
+                    k += 1
+            used_names.add(filename)
+
+            zf.writestr(filename, xbuf.read())
+
+    zip_buf.seek(0)
+    return zip_buf.getvalue()
 
 
 # -----------------------------
@@ -238,9 +285,9 @@ def build_output_excel(df_out: pd.DataFrame, hide_indirect: bool) -> bytes:
 st.markdown(
     """
     <div style="padding: 1rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 1rem;">
-      <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Summary (Merge Debugger)</div>
+      <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Summary (Per-PI ZIP)</div>
       <div style="opacity: 0.85; margin-top: 0.25rem;">
-        Preview both files, choose merge columns, check match rate, then generate the final Excel output.
+        Preview both files, choose merge columns, validate match rate, then download one ZIP with one Excel file per PI.
       </div>
     </div>
     """,
@@ -256,7 +303,7 @@ master_file = st.file_uploader("Upload Aggie Enterprise Database (Excel)", type=
 award_file = st.file_uploader("Upload Award Info (Excel)", type=["xlsx"])
 
 date_pulled = st.text_input("Date Pulled (optional)", value="")
-hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in final output", value=True)
+hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in PI files", value=True)
 
 if master_file and award_file:
     try:
@@ -287,10 +334,10 @@ if master_file and award_file:
         st.markdown("---")
         st.markdown("### Choose merge columns")
 
-        # Defaults based on your description (but user can override)
+        # Defaults based on your typical fields (but user can override)
         default_master_merge = PROJECT_COL_NAME if PROJECT_COL_NAME in df_master_view.columns else df_master_view.columns[0]
         default_aw_merge = None
-        for cand in ["Aggie Enterprise Project #", "AGGIE ENTERPRISE PROJECT #"]:
+        for cand in ["Aggie Enterprise Project #", "AGGIE ENTERPRISE PROJECT #", "AGGIE ENTERPRISE PROJECT # "]:
             if cand in df_award.columns:
                 default_aw_merge = cand
                 break
@@ -356,19 +403,19 @@ if master_file and award_file:
                 st.code(", ".join(missing[:40]))
 
         st.markdown("---")
-        st.markdown("### Generate output")
+        st.markdown("### Generate Per-PI ZIP")
 
-        if st.button("Generate Output Excel", type="primary"):
+        if st.button("Generate ZIP (one Excel per PI)", type="primary"):
             # Work on a copy of the master view (already filtered to Active if chosen)
-            df_work = df_master_view.copy()
+            df_work_full = df_master_view.copy()
 
             # Identify needed master columns
-            project_col = find_column_by_exact_or_keywords(df_work.columns, PROJECT_COL_NAME, keywords=["project", "number"])
-            task_name_col = find_column_by_exact_or_keywords(df_work.columns, TASK_NAME_COL_NAME, keywords=["task", "name"])
-            task_num_col = find_column_by_exact_or_keywords(df_work.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"])
+            project_col = find_column_by_exact_or_keywords(df_work_full.columns, PROJECT_COL_NAME, keywords=["project", "number"])
+            task_name_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NAME_COL_NAME, keywords=["task", "name"])
+            task_num_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"])
 
             # Budget Balance column is variable in name
-            balance_candidates = [c for c in df_work.columns if str(c).startswith("Budget Balance")]
+            balance_candidates = [c for c in df_work_full.columns if str(c).startswith("Budget Balance")]
             if not balance_candidates:
                 raise KeyError("Master is missing a column starting with 'Budget Balance'.")
             balance_col = balance_candidates[0]
@@ -386,14 +433,13 @@ if master_file and award_file:
                 "expenses",
                 balance_col,
             ]:
-                if c in df_work.columns and c not in keep_cols:
+                if c in df_work_full.columns and c not in keep_cols:
                     keep_cols.append(c)
 
-            df_work = df_work[keep_cols].copy()
+            df_work = df_work_full[keep_cols].copy()
 
             # Prepare merge keys from the USER-SELECTED columns
-            # Note: we use df_master_view (same indexing) so keys align with filtered rows
-            df_work["_merge_key"] = df_master_view[master_merge_col].apply(canon_key)
+            df_work["_merge_key"] = df_work_full[master_merge_col].apply(canon_key)
 
             df_aw = df_award.copy()
             df_aw["_merge_key"] = df_aw[award_merge_col].apply(canon_key)
@@ -406,7 +452,7 @@ if master_file and award_file:
             # Merge
             df_merged = df_work.merge(df_aw_sub, on="_merge_key", how="left").drop(columns=["_merge_key"])
 
-            # Merge diagnostic by rows (not unique keys)
+            # Row-level merge diagnostic
             matched_rows = df_merged["Indirect Rate"].notna().sum()
             total_rows = len(df_merged)
             st.info(f"Row-level merge match: {matched_rows}/{total_rows} ({(matched_rows/total_rows if total_rows else 0):.1%})")
@@ -443,12 +489,14 @@ if master_file and award_file:
             df_merged = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
 
             # Date Pulled
-            if safe_str(date_pulled):
-                df_merged["Date Pulled"] = safe_str(date_pulled)
+            date_label = safe_str(date_pulled)
+            if date_label:
+                df_merged["Date Pulled"] = date_label
 
-            # Normalize PI to Last, First (if present)
-            if PI_COL_NAME in df_merged.columns:
-                df_merged[PI_COL_NAME] = df_merged[PI_COL_NAME].apply(normalize_pi_last_first)
+            # Normalize PI to Last, First
+            if PI_COL_NAME not in df_merged.columns:
+                raise KeyError(f"PI column '{PI_COL_NAME}' not found in master. Columns: {list(df_merged.columns)}")
+            df_merged[PI_COL_NAME] = df_merged[PI_COL_NAME].apply(normalize_pi_last_first)
 
             # Reorder (best effort)
             desired = [
@@ -466,14 +514,24 @@ if master_file and award_file:
             remaining = [c for c in df_merged.columns if c not in desired]
             df_out = df_merged[desired + remaining]
 
-            out_bytes = build_output_excel(df_out, hide_indirect=hide_indirect_in_output)
+            report_label = "Budget Summary"
+            if date_label:
+                report_label = f"{date_label} Budget Summary"
 
-            st.success("Output generated!")
+            # Build ZIP
+            zip_bytes = build_pi_zip(
+                df_out=df_out,
+                pi_col=PI_COL_NAME,
+                hide_indirect=hide_indirect_in_output,
+                report_label=report_label,
+            )
+
+            st.success("ZIP generated!")
             st.download_button(
-                "Download Budget Summary (Excel)",
-                data=out_bytes,
-                file_name="Budget_Summary.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "Download ZIP (PI files)",
+                data=zip_bytes,
+                file_name=f"{make_safe_filename_fragment(report_label)} - PI Files.zip",
+                mime="application/zip",
             )
 
     except Exception as e:
