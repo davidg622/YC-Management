@@ -246,14 +246,7 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
                 group = group.sort_values(by=ALLOC_BUDGET_NET_COL, ascending=False, na_position="last")
 
             # Footnote per PI (if one indirect rate)
-            if "Indirect Rate" in group.columns:
-                uniq = pd.Series(group["Indirect Rate"].dropna().unique())
-                if len(uniq) == 1:
-                    footnote = f"* Calculated minus the indirect costs (Indirect Rate = {float(uniq.iloc[0]):.2%})."
-                else:
-                    footnote = "* Calculated minus the indirect costs (Indirect Rate varies by project)."
-            else:
-                footnote = "* Calculated minus the indirect costs."
+                footnote = "* Calculated minus the indirect costs, if applicable."
 
             currency_cols = [c for c in [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"] if c in group.columns]
 
