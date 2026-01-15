@@ -1,18 +1,25 @@
 import re
 import traceback
-import streamlit as st
-import pandas as pd
 from io import BytesIO
-import zipfile
 
-from openpyxl.styles import numbers, PatternFill, Font
+import pandas as pd
+import streamlit as st
+from openpyxl.styles import Font, PatternFill, numbers
 from openpyxl.utils import get_column_letter
+
+# ============================================================
+# Yellow Cluster: Budget Summary (Merge Debugger)
+# - Preview both files BEFORE merge
+# - Let user SELECT merge columns for Master and Award
+# - Show match-rate diagnostics (keys overlap + unmatched samples)
+# - Generate ONE final Excel output (no PI/org sorting, no folders)
+# ============================================================
 
 # -----------------------------
 # PAGE CONFIG (must be first Streamlit call)
 # -----------------------------
 st.set_page_config(
-    page_title="Yellow Cluster: Monthly PI Budget Summary Generator",
+    page_title="Yellow Cluster: Budget Summary (Merge Debugger)",
     page_icon="🐄",
     layout="wide",
 )
@@ -21,40 +28,55 @@ st.set_page_config(
 # SETTINGS
 # -----------------------------
 SUMMARY_SHEET_NAME = "Summary"
-HEADER_ROW_INDEX = 17  # 0-based index: Excel row 18
+HEADER_ROW_INDEX = 17  # 0-based index: Excel row 18 (i.e., delete first 17 rows)
 
-# Aggie Enterprise Database (master) column identifiers
+# Master (Aggie) column identifiers we use for the final output
 PI_COL_NAME = "Project Principal Investigator"
-PROJECT_COL_NAME = "Project Number"  # in your file: column J after dropping first 17 rows
+PROJECT_COL_NAME = "Project Number"
 TASK_NAME_COL_NAME = "Task Name"
 TASK_NUMBER_COL_NAME = "Task Number"
 STATUS_COL_NAME = "Task Status"
-OWNING_ORG_COL_NAME = "Project Owning Organization"
 
-# Award Info preferred header names (if present)
-AWARD_INFO_PROJECT_COL = "AGGIE ENTERPRISE PROJECT #"
-AWARD_INFO_INDIRECT_COL = "INDIRECT RATE"
-
-# Award Info fallback by position (Excel letters E and L)
-# Zero-based indices: E=4, L=11
-AWARD_PROJECT_COL_IDX = 4
-AWARD_INDIRECT_COL_IDX = 11
-
-# Output labels
 ALLOC_BUDGET_NET_COL = "Allocated Budget*"
 CURRENT_BAL_NET_COL = "Current Balance*"
-BALANCE_EX_INDIRECT_COL = CURRENT_BAL_NET_COL  # styling highlight
-
 
 # -----------------------------
 # Helpers
 # -----------------------------
 def normalize_columns(cols):
-    """Normalize column names to avoid hidden whitespace/nonbreaking spaces."""
-    out = []
-    for c in cols:
-        out.append(str(c).replace("\xa0", " ").strip())
-    return out
+    return [str(c).replace("\xa0", " ").strip() for c in cols]
+
+
+def safe_str(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, float) and pd.isna(x):
+        return ""
+    return str(x).replace("\xa0", " ").strip()
+
+
+def canon_key(x) -> str:
+    """
+    Canonicalize merge keys without destroying alphanumeric IDs.
+    - Trim
+    - Remove spaces/punctuation
+    - Uppercase
+    - If purely numeric-like, normalize 12345.0 -> 12345
+    """
+    s = safe_str(x)
+    if not s:
+        return ""
+
+    # numeric-like?
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", s).upper()
+    return cleaned
 
 
 def find_column_by_exact_or_keywords(columns, target_name, keywords=None):
@@ -73,147 +95,51 @@ def find_column_by_exact_or_keywords(columns, target_name, keywords=None):
     )
 
 
-def find_project_number_column(columns):
-    """
-    Robust Project Number finder for Aggie Enterprise exports.
-    Accepts variations like:
-      - Project Number
-      - Project #
-      - Project ID
-      - Project No
-    """
-    try:
-        return find_column_by_exact_or_keywords(columns, PROJECT_COL_NAME, keywords=["project", "number"])
-    except KeyError:
-        pass
-
-    candidates = []
-    for c in columns:
-        low = c.lower()
-        if "project" in low and ("number" in low or "#" in low or " id" in low or low.endswith("id") or " no" in low):
-            candidates.append(c)
-
-    if len(candidates) == 1:
-        return candidates[0]
-
-    raise KeyError(
-        "Could not uniquely identify the Project Number column.\n"
-        f"Candidates: {candidates}\n"
-        f"All columns: {list(columns)}"
-    )
-
-
-def canon_project_key(x) -> str:
-    """
-    Canonicalize project identifiers so Aggie Enterprise + Award Info match.
-
-    IMPORTANT: must support alphanumeric IDs like SP0A221585, K30BOWISRA.
-
-    Rules:
-    - Trim whitespace / normalize
-    - If purely numeric-like -> normalize 12345.0 -> '12345'
-    - Else -> keep full alphanumeric content (remove punctuation/spaces), uppercase
-    """
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return ""
-
-    s = str(x).replace("\xa0", " ").strip()
-    if not s:
-        return ""
-
-    # numeric-like?
-    try:
-        f = float(s)
-        if f.is_integer():
-            return str(int(f))
-    except Exception:
-        pass
-
-    # keep full alphanumeric code (critical for SP0A..., K30..., etc.)
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", s).upper()
-    return cleaned
-
-
-def make_safe_filename_fragment(name: str) -> str:
-    frag = str(name)
-    for ch in r'\/:*?"<>|':
-        frag = frag.replace(ch, "_")
-    frag = frag.strip()
-    return frag[:80] if frag else "Unknown"
-
-
-def normalize_pi_name(pi: str) -> str:
-    """Normalize PI names to 'Last, First' form."""
-    pi = str(pi).replace("\xa0", " ").strip()
-    if not pi:
-        return "Unknown PI"
-    if "," in pi:
-        return pi
-    parts = pi.split()
-    if len(parts) >= 2:
-        first = " ".join(parts[:-1])
-        last = parts[-1]
-        return f"{last}, {first}"
-    return pi
-
-
-def compute_org7(value) -> str:
-    """Folder key from Project Owning Organization: first 7 alnum chars, uppercase."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return "UnknownOrg"
-    s = str(value).replace("\xa0", " ").strip()
-    if not s:
-        return "UnknownOrg"
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", s).upper()
-    if len(cleaned) >= 7:
-        return cleaned[:7]
-    return cleaned if cleaned else "UnknownOrg"
-
-
-def apply_currency_format(workbook, sheet_name, columns):
-    ws = workbook[sheet_name]
+def apply_currency_format(wb, ws_name, columns):
+    ws = wb[ws_name]
     header_row = next(ws.iter_rows(min_row=1, max_row=1))
-
-    header_to_letter = {}
+    pos = {}
     for cell in header_row:
         if cell.value in columns:
-            header_to_letter[cell.value] = cell.column_letter
+            pos[cell.value] = cell.column_letter
 
-    for _, col_letter in header_to_letter.items():
+    for _, col_letter in pos.items():
         for cell in ws[col_letter]:
             if cell.row == 1:
                 continue
             cell.number_format = numbers.FORMAT_CURRENCY_USD_SIMPLE
 
 
-def style_sheet(workbook, sheet_name, currency_cols, footnote_text, hide_indirect=True):
-    ws = workbook[sheet_name]
+def style_sheet(wb, ws_name, currency_cols, footnote_text, hide_indirect=True):
+    ws = wb[ws_name]
 
-    apply_currency_format(workbook, sheet_name, currency_cols)
+    apply_currency_format(wb, ws_name, currency_cols)
 
     header_font = Font(bold=True, size=12)
     body_font = Font(size=11)
 
     header_row = next(ws.iter_rows(min_row=1, max_row=1))
-    balance_col_letter = None
     indirect_col_letter = None
+    balance_col_letter = None
 
     for cell in header_row:
         cell.font = header_font
-        if cell.value == BALANCE_EX_INDIRECT_COL:
+        if cell.value == CURRENT_BAL_NET_COL:
             balance_col_letter = cell.column_letter
             cell.fill = PatternFill(start_color="FFFAD7", end_color="FFFAD7", fill_type="solid")
         if cell.value == "Indirect Rate":
             indirect_col_letter = cell.column_letter
 
+    # alternating row shading
     fill_green = PatternFill(start_color="FFE6F4EA", end_color="FFE6F4EA", fill_type="solid")
-    for row_idx in range(2, ws.max_row + 1):
-        for cell in ws[row_idx]:
+    for r in range(2, ws.max_row + 1):
+        for cell in ws[r]:
             cell.font = body_font
-            if row_idx % 2 == 0:
+            if r % 2 == 0:
                 cell.fill = fill_green
 
-    if balance_col_letter is not None:
+    # color code current balance*
+    if balance_col_letter:
         for cell in ws[balance_col_letter]:
             if cell.row == 1:
                 continue
@@ -226,450 +152,333 @@ def style_sheet(workbook, sheet_name, currency_cols, footnote_text, hide_indirec
                     color = "004B00"
             except Exception:
                 pass
+            cell.font = Font(bold=True, size=11, color=color) if color else Font(bold=True, size=11)
 
-            if color:
-                cell.font = Font(bold=True, size=11, color=color)
-            else:
-                cell.font = Font(bold=True, size=11)
-
+    # widths
     for col in ws.columns:
-        max_length = 0
+        max_len = 0
         col_letter = get_column_letter(col[0].column)
         for cell in col:
             if cell.value is not None:
-                max_length = max(max_length, len(str(cell.value)))
-        ws.column_dimensions[col_letter].width = max(10, min(max_length + 2, 50))
+                max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = max(10, min(max_len + 2, 50))
 
-    if indirect_col_letter is not None and hide_indirect:
+    # hide indirect if requested
+    if hide_indirect and indirect_col_letter:
         ws.column_dimensions[indirect_col_letter].hidden = True
 
+    # footnote
     footer_row = ws.max_row + 2
     ws[f"A{footer_row}"] = footnote_text
     ws[f"A{footer_row}"].font = Font(italic=True, size=10)
 
 
-def build_zip_by_org7_and_pi(df_merged, base_name, currency_cols, footnote_text, hide_indirect=True):
+def read_aggy_master(master_bytes: bytes) -> pd.DataFrame:
     """
-    ZIP structure:
-      <Org7>/<Report Label> - <Last, First>.xlsx
+    Reads Aggie Enterprise Database:
+      - Sheet 'Summary'
+      - Uses row 18 as header (0-based index 17)
     """
-    zip_buf = BytesIO()
-    used_paths = set()
-
-    report_label = base_name.replace("_", " ").strip()
-    grouped = df_merged.groupby(["_Org7", "_PI_stripped"], sort=True)
-
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for (org7, pi), group in grouped:
-            if group.empty:
-                continue
-
-            org7_safe = make_safe_filename_fragment(org7)
-            pi_label = normalize_pi_name(pi)
-            safe_pi = make_safe_filename_fragment(pi_label)
-
-            filename = f"{report_label} - {safe_pi}.xlsx"
-            zip_path = f"{org7_safe}/{filename}"
-
-            if zip_path in used_paths:
-                suffix = 2
-                while True:
-                    candidate_filename = f"{report_label} - {safe_pi} ({suffix}).xlsx"
-                    candidate_path = f"{org7_safe}/{candidate_filename}"
-                    if candidate_path not in used_paths:
-                        zip_path = candidate_path
-                        break
-                    suffix += 1
-            used_paths.add(zip_path)
-
-            out = group.drop(columns=["_PI_stripped", "_Org7", OWNING_ORG_COL_NAME], errors="ignore").copy()
-
-            pi_buf = BytesIO()
-            with pd.ExcelWriter(pi_buf, engine="openpyxl") as writer:
-                out.to_excel(writer, index=False, sheet_name="Budget Summary")
-                wb = writer.book
-                style_sheet(wb, "Budget Summary", currency_cols, footnote_text, hide_indirect=hide_indirect)
-            pi_buf.seek(0)
-
-            zf.writestr(zip_path, pi_buf.read())
-
-    zip_buf.seek(0)
-    return zip_buf.getvalue()
-
-
-def read_award_info_minimal(award_bytes: bytes) -> pd.DataFrame:
-    """
-    Read Award Info and return standardized 2-column dataframe:
-      - 'AGGIE ENTERPRISE PROJECT #'
-      - 'INDIRECT RATE'
-
-    Uses headers if present; otherwise uses Excel positions:
-      - Column E (index 4) for project #
-      - Column L (index 11) for indirect rate
-    """
-    df_aw = pd.read_excel(BytesIO(award_bytes))
-    df_aw.columns = normalize_columns(df_aw.columns)
-
-    if (AWARD_INFO_PROJECT_COL in df_aw.columns) and (AWARD_INFO_INDIRECT_COL in df_aw.columns):
-        return df_aw[[AWARD_INFO_PROJECT_COL, AWARD_INFO_INDIRECT_COL]].copy()
-
-    if df_aw.shape[1] <= max(AWARD_PROJECT_COL_IDX, AWARD_INDIRECT_COL_IDX):
-        raise KeyError(
-            "Award Info file does not have enough columns to use fallback (E and L). "
-            f"Detected columns: {df_aw.shape[1]}"
-        )
-
-    out = df_aw.iloc[:, [AWARD_PROJECT_COL_IDX, AWARD_INDIRECT_COL_IDX]].copy()
-    out.columns = [AWARD_INFO_PROJECT_COL, AWARD_INFO_INDIRECT_COL]
-    return out
-
-
-# -----------------------------
-# Processing (Streamlit Cloud friendly)
-# -----------------------------
-def process_workbooks_bytes(
-    master_bytes,
-    award_bytes_list,
-    date_pulled="",
-    pi_filter="",
-    org7_filter="",
-    show_merge_diagnostics=False,
-    reveal_indirect_for_debug=False,
-):
-    base_name = "Budget_Report"
-    prefix = (date_pulled or "").strip()
-    if prefix:
-        base_name = f"{prefix}_{base_name}"
-
-    # ---- Read master summary sheet (no header) ----
     df_raw = pd.read_excel(BytesIO(master_bytes), sheet_name=SUMMARY_SHEET_NAME, header=None)
-
     header = df_raw.iloc[HEADER_ROW_INDEX]
     df = df_raw.iloc[HEADER_ROW_INDEX + 1 :].copy()
     df.columns = header
     df = df.dropna(how="all")
     df.columns = normalize_columns(df.columns)
+    return df
 
-    # Identify columns
-    pi_col = find_column_by_exact_or_keywords(df.columns, PI_COL_NAME, keywords=["principal", "investigator"])
-    project_col = find_project_number_column(df.columns)  # should resolve to "Project Number"
-    task_name_col = find_column_by_exact_or_keywords(df.columns, TASK_NAME_COL_NAME, keywords=["task", "name"])
-    task_number_col = find_column_by_exact_or_keywords(df.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"])
-    status_col = find_column_by_exact_or_keywords(df.columns, STATUS_COL_NAME, keywords=["task", "status"])
-    owning_org_col = find_column_by_exact_or_keywords(df.columns, OWNING_ORG_COL_NAME, keywords=["owning", "org"])
 
-    # Budget Balance column
-    balance_col_candidates = [c for c in df.columns if str(c).startswith("Budget Balance")]
-    if not balance_col_candidates:
-        raise KeyError(
-            "Could not find a column whose name starts with 'Budget Balance'. "
-            f"Columns seen: {list(df.columns)}"
+def read_award(award_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    xl = pd.ExcelFile(BytesIO(award_bytes))
+    df = pd.read_excel(xl, sheet_name=sheet_name)
+    df.columns = normalize_columns(df.columns)
+    return df
+
+
+def normalize_pi_last_first(pi_val: str) -> str:
+    s = safe_str(pi_val)
+    if not s:
+        return ""
+    if "," in s:
+        return s
+    parts = s.split()
+    if len(parts) >= 2:
+        return f"{parts[-1]}, {' '.join(parts[:-1])}"
+    return s
+
+
+def build_output_excel(df_out: pd.DataFrame, hide_indirect: bool) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_out.to_excel(writer, index=False, sheet_name="Budget Summary")
+        wb = writer.book
+
+        # Footnote depends on whether one indirect rate dominates
+        if "Indirect Rate" in df_out.columns:
+            unique_rates = pd.Series(df_out["Indirect Rate"].dropna().unique())
+            if len(unique_rates) == 1:
+                footnote = f"* Calculated minus the indirect costs (Indirect Rate = {float(unique_rates.iloc[0]):.2%})."
+            else:
+                footnote = "* Calculated minus the indirect costs (Indirect Rate varies by project)."
+        else:
+            footnote = "* Calculated minus the indirect costs."
+
+        currency_cols = [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"]
+        currency_cols = [c for c in currency_cols if c in df_out.columns]
+
+        style_sheet(wb, "Budget Summary", currency_cols, footnote, hide_indirect=hide_indirect)
+
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.markdown(
+    """
+    <div style="padding: 1rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 1rem;">
+      <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Summary (Merge Debugger)</div>
+      <div style="opacity: 0.85; margin-top: 0.25rem;">
+        Preview both files, choose merge columns, check match rate, then generate the final Excel output.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+with st.expander("Debug options", expanded=False):
+    show_trace = st.checkbox("Show full error trace", value=False)
+    show_unmatched = st.checkbox("Show unmatched key samples", value=True)
+    show_key_samples = st.checkbox("Show key samples from both files", value=True)
+
+master_file = st.file_uploader("Upload Aggie Enterprise Database (Excel)", type=["xlsx"])
+award_file = st.file_uploader("Upload Award Info (Excel)", type=["xlsx"])
+
+date_pulled = st.text_input("Date Pulled (optional)", value="")
+hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in final output", value=True)
+
+if master_file and award_file:
+    try:
+        master_bytes = master_file.getvalue()
+        award_bytes = award_file.getvalue()
+
+        # Read both
+        df_master = read_aggy_master(master_bytes)
+
+        xl_aw = pd.ExcelFile(BytesIO(award_bytes))
+        award_sheet = st.selectbox("Award sheet to use", options=xl_aw.sheet_names, index=0)
+        df_award = read_award(award_bytes, sheet_name=award_sheet)
+
+        # Option: filter master to Active by default
+        do_active_only = st.checkbox("Master: keep only Task Status == Active", value=True)
+        status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["task", "status"])
+        df_master_view = df_master[df_master[status_col] == "Active"].copy() if do_active_only else df_master.copy()
+
+        st.markdown("### Preview (before merge)")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Aggie Enterprise (Master) preview**")
+            st.dataframe(df_master_view.head(25), use_container_width=True)
+        with c2:
+            st.markdown("**Award Info preview**")
+            st.dataframe(df_award.head(25), use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("### Choose merge columns")
+
+        # Defaults based on your description (but user can override)
+        default_master_merge = PROJECT_COL_NAME if PROJECT_COL_NAME in df_master_view.columns else df_master_view.columns[0]
+        default_aw_merge = None
+        for cand in ["Aggie Enterprise Project #", "AGGIE ENTERPRISE PROJECT #"]:
+            if cand in df_award.columns:
+                default_aw_merge = cand
+                break
+        if default_aw_merge is None:
+            default_aw_merge = df_award.columns[0]
+
+        master_merge_col = st.selectbox(
+            "Master merge column",
+            options=list(df_master_view.columns),
+            index=list(df_master_view.columns).index(default_master_merge) if default_master_merge in df_master_view.columns else 0,
         )
-    balance_col = balance_col_candidates[0]
-
-    # Filter active
-    df_active = df[df[status_col] == "Active"].copy()
-    if df_active.empty:
-        raise ValueError("No rows found with Task Status == 'Active'.")
-
-    # Sort (DO NOT coerce Project Number to numeric; it is alphanumeric in your file)
-    df_active[task_number_col] = pd.to_numeric(df_active[task_number_col], errors="coerce")
-    df_active = df_active.sort_values(by=[pi_col, project_col, task_number_col], na_position="last")
-
-    # Keep required columns
-    needed_cols = [
-        pi_col,
-        project_col,
-        task_name_col,
-        task_number_col,
-        "Project Name",
-        "Project Manager",
-        owning_org_col,
-        "Budget",
-        "expenses",
-        balance_col,
-    ]
-    needed_cols = [c for c in needed_cols if c in df_active.columns]
-    df_active = df_active[needed_cols].copy()
-
-    # Merge key BEFORE mutating Project Number display
-    df_active["_proj_key"] = df_active[project_col].apply(canon_project_key)
-
-    # Combine Project Number + Task Number into displayed Project Number
-    p = df_active[project_col].astype(str).replace("nan", "").str.replace(".0", "", regex=False).str.strip()
-    t = df_active[task_number_col].astype(str).replace("nan", "").str.replace(".0", "", regex=False).str.strip()
-    df_active[project_col] = (p + "-" + t).str.strip("-")
-
-    # Combine Project Name + Task Name into Project Name
-    if "Project Name" in df_active.columns:
-        df_active["Project Name"] = (
-            df_active["Project Name"].astype(str).str.strip()
-            + " – "
-            + df_active[task_name_col].astype(str).str.strip()
+        award_merge_col = st.selectbox(
+            "Award merge column",
+            options=list(df_award.columns),
+            index=list(df_award.columns).index(default_aw_merge) if default_aw_merge in df_award.columns else 0,
         )
 
-    # Drop task columns
-    df_active = df_active.drop(columns=[task_name_col, task_number_col], errors="ignore")
+        # Choose indirect-rate column explicitly
+        default_aw_rate = None
+        for cand in ["INDIRECT RATE", "Indirect Rate", "Indirect rate"]:
+            if cand in df_award.columns:
+                default_aw_rate = cand
+                break
+        if default_aw_rate is None:
+            indirect_candidates = [c for c in df_award.columns if "indirect" in c.lower()]
+            default_aw_rate = indirect_candidates[0] if indirect_candidates else df_award.columns[-1]
 
-    # Rename budget columns
-    df_active = df_active.rename(
-        columns={
-            "Budget": "Allocated Budget",
-            balance_col: "Current Balance",
-        }
-    )
+        award_rate_col = st.selectbox(
+            "Award indirect-rate column",
+            options=list(df_award.columns),
+            index=list(df_award.columns).index(default_aw_rate) if default_aw_rate in df_award.columns else 0,
+        )
 
-    # ---- Read award info (E + L fallback) ----
-    award_dfs = [read_award_info_minimal(b) for b in award_bytes_list]
-    award_df = pd.concat(award_dfs, ignore_index=True)
+        # Merge preview metrics
+        master_keys = df_master_view[master_merge_col].apply(canon_key)
+        award_keys = df_award[award_merge_col].apply(canon_key)
 
-    # Canonicalize award key using FULL alphanumeric codes (matches SP0A..., K30..., etc.)
-    award_df["_proj_key"] = award_df[AWARD_INFO_PROJECT_COL].apply(canon_project_key)
-    award_df = award_df.drop_duplicates(subset=["_proj_key"], keep="first")
+        master_key_set = set(k for k in master_keys.unique() if k)
+        award_key_set = set(k for k in award_keys.unique() if k)
+        intersect = master_key_set.intersection(award_key_set)
+        match_rate_unique = (len(intersect) / len(master_key_set)) if master_key_set else 0.0
 
-    # Merge
-    df_merged = df_active.merge(
-        award_df[["_proj_key", AWARD_INFO_INDIRECT_COL]],
-        on="_proj_key",
-        how="left",
-    ).rename(columns={AWARD_INDIRECT_COL_IDX: "Indirect Rate", AWARD_INFO_INDIRECT_COL: "Indirect Rate"})
+        st.markdown("### Merge preview")
+        st.write(f"**Unique master keys:** {len(master_key_set)}")
+        st.write(f"**Unique award keys:** {len(award_key_set)}")
+        st.write(f"**Key overlap (unique):** {len(intersect)}")
+        st.write(f"**Approx. match rate (unique master keys found in award):** {match_rate_unique:.1%}")
 
-    # Diagnostics
-    matched = df_merged["Indirect Rate"].notna().sum()
-    total = len(df_merged)
-    match_rate = matched / total if total else 0.0
+        if show_key_samples:
+            st.markdown("**Key samples (canonicalized)**")
+            c3, c4 = st.columns(2)
+            with c3:
+                st.caption("Master key sample")
+                st.code(", ".join(list(master_key_set)[:20]) if master_key_set else "(none)")
+            with c4:
+                st.caption("Award key sample")
+                st.code(", ".join(list(award_key_set)[:20]) if award_key_set else "(none)")
 
-    if show_merge_diagnostics:
-        st.write(f"🔎 Award merge match rate: {matched}/{total} ({match_rate:.1%})")
-        if match_rate < 0.90:
-            st.warning("Low match rate between Aggie Enterprise Project Number and Award Info AE Project #.")
-            st.write("Sample master keys:")
-            st.write(df_active["_proj_key"].dropna().astype(str).unique()[:15])
-            st.write("Sample award keys:")
-            st.write(award_df["_proj_key"].dropna().astype(str).unique()[:15])
-            st.write("Rows missing Indirect Rate (first 20):")
-            st.dataframe(df_merged[df_merged["Indirect Rate"].isna()].head(20))
+        if show_unmatched:
+            missing = sorted(list(master_key_set - award_key_set))[:40]
+            if missing:
+                st.warning("Some master keys were not found in award keys (sample):")
+                st.code(", ".join(missing[:40]))
 
-    # Drop merge key from output
-    df_merged = df_merged.drop(columns=["_proj_key"], errors="ignore")
+        st.markdown("---")
+        st.markdown("### Generate output")
 
-    # Compute net-of-indirect columns (missing indirect => 0)
-    df_merged["Indirect Rate"] = pd.to_numeric(df_merged["Indirect Rate"], errors="coerce").fillna(0.0)
-    df_merged["Allocated Budget"] = pd.to_numeric(df_merged["Allocated Budget"], errors="coerce")
-    df_merged["Current Balance"] = pd.to_numeric(df_merged["Current Balance"], errors="coerce")
+        if st.button("Generate Output Excel", type="primary"):
+            # Work on a copy of the master view (already filtered to Active if chosen)
+            df_work = df_master_view.copy()
 
-    denom = 1.0 + df_merged["Indirect Rate"]
-    df_merged[ALLOC_BUDGET_NET_COL] = df_merged["Allocated Budget"] / denom
-    df_merged[CURRENT_BAL_NET_COL] = df_merged["Current Balance"] / denom
+            # Identify needed master columns
+            project_col = find_column_by_exact_or_keywords(df_work.columns, PROJECT_COL_NAME, keywords=["project", "number"])
+            task_name_col = find_column_by_exact_or_keywords(df_work.columns, TASK_NAME_COL_NAME, keywords=["task", "name"])
+            task_num_col = find_column_by_exact_or_keywords(df_work.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"])
 
-    # Drop gross columns
-    df_merged = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
+            # Budget Balance column is variable in name
+            balance_candidates = [c for c in df_work.columns if str(c).startswith("Budget Balance")]
+            if not balance_candidates:
+                raise KeyError("Master is missing a column starting with 'Budget Balance'.")
+            balance_col = balance_candidates[0]
 
-    # Standardize PI col
-    if pi_col in df_merged.columns and pi_col != "Principal Investigator":
-        df_merged = df_merged.rename(columns={pi_col: "Principal Investigator"})
-        pi_col = "Principal Investigator"
+            # Keep minimal set if present
+            keep_cols = []
+            for c in [
+                PI_COL_NAME,
+                project_col,
+                "Project Name",
+                "Project Manager",
+                task_name_col,
+                task_num_col,
+                "Budget",
+                "expenses",
+                balance_col,
+            ]:
+                if c in df_work.columns and c not in keep_cols:
+                    keep_cols.append(c)
 
-    df_merged["_PI_stripped"] = df_merged[pi_col].astype(str).apply(normalize_pi_name)
-    df_merged[pi_col] = df_merged["_PI_stripped"]
+            df_work = df_work[keep_cols].copy()
 
-    # Standardize owning org col
-    if owning_org_col != OWNING_ORG_COL_NAME and owning_org_col in df_merged.columns:
-        df_merged = df_merged.rename(columns={owning_org_col: OWNING_ORG_COL_NAME})
-    if OWNING_ORG_COL_NAME not in df_merged.columns:
-        raise KeyError(f"'{OWNING_ORG_COL_NAME}' column not found after processing.")
+            # Prepare merge keys from the USER-SELECTED columns
+            # Note: we use df_master_view (same indexing) so keys align with filtered rows
+            df_work["_merge_key"] = df_master_view[master_merge_col].apply(canon_key)
 
-    df_merged["_Org7"] = df_merged[OWNING_ORG_COL_NAME].apply(compute_org7)
+            df_aw = df_award.copy()
+            df_aw["_merge_key"] = df_aw[award_merge_col].apply(canon_key)
 
-    # Date pulled
-    if prefix:
-        df_merged["Date Pulled"] = prefix
+            # Award subset with indirect rate
+            df_aw_sub = df_aw[["_merge_key", award_rate_col]].copy()
+            df_aw_sub = df_aw_sub.drop_duplicates(subset=["_merge_key"], keep="first")
+            df_aw_sub = df_aw_sub.rename(columns={award_rate_col: "Indirect Rate"})
 
-    # Filters
-    pi_query = (pi_filter or "").strip().lower()
-    org_query = (org7_filter or "").strip().upper()
+            # Merge
+            df_merged = df_work.merge(df_aw_sub, on="_merge_key", how="left").drop(columns=["_merge_key"])
 
-    if pi_query:
-        df_merged = df_merged[df_merged["_PI_stripped"].astype(str).str.lower().str.contains(pi_query, na=False)]
-    if org_query:
-        df_merged = df_merged[df_merged["_Org7"].astype(str).str.upper() == org_query]
+            # Merge diagnostic by rows (not unique keys)
+            matched_rows = df_merged["Indirect Rate"].notna().sum()
+            total_rows = len(df_merged)
+            st.info(f"Row-level merge match: {matched_rows}/{total_rows} ({(matched_rows/total_rows if total_rows else 0):.1%})")
 
-    if df_merged.empty:
-        raise ValueError("No records matched your filter(s). Clear filters or try different values.")
+            # Combine Project Number + Task Number in Project Number column
+            p = df_merged[project_col].apply(safe_str).str.replace(".0", "", regex=False)
+            t = df_merged[task_num_col].apply(safe_str).str.replace(".0", "", regex=False)
+            df_merged[project_col] = (p + "-" + t).str.strip("-")
 
-    # Footnote
-    unique_rates = pd.Series(df_merged["Indirect Rate"].dropna().unique())
-    if len(unique_rates) == 1:
-        footnote_text = f"* Calculated minus the indirect costs (Indirect Rate = {float(unique_rates.iloc[0]):.2%})."
-    else:
-        footnote_text = "* Calculated minus the indirect costs (Indirect Rate varies by project)."
-
-    currency_cols = [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"]
-
-    zip_bytes = build_zip_by_org7_and_pi(
-        df_merged,
-        base_name,
-        currency_cols,
-        footnote_text,
-        hide_indirect=(not reveal_indirect_for_debug),
-    )
-
-    summary = {
-        "base_name": base_name,
-        "date_pulled": prefix or "(not specified)",
-        "num_rows": int(len(df_merged)),
-        "num_pis": int(df_merged["_PI_stripped"].nunique(dropna=True)),
-        "num_org7": int(df_merged["_Org7"].nunique(dropna=True)),
-        "org7_examples": [str(x) for x in df_merged["_Org7"].dropna().unique()[:8]],
-        "merge_match_rate": match_rate,
-        "merge_matched_rows": int(matched),
-        "merge_total_rows": int(total),
-    }
-    return base_name, zip_bytes, summary
-
-
-@st.cache_data(show_spinner=False)
-def process_workbooks_cached(master_bytes, award_bytes_list, date_pulled, pi_filter, org7_filter, show_merge_diagnostics, reveal_indirect_for_debug):
-    return process_workbooks_bytes(
-        master_bytes,
-        award_bytes_list,
-        date_pulled,
-        pi_filter,
-        org7_filter,
-        show_merge_diagnostics,
-        reveal_indirect_for_debug,
-    )
-
-
-# -----------------------------
-# UI helpers
-# -----------------------------
-def ucd_banner():
-    st.markdown(
-        """
-        <div style="
-            background: linear-gradient(90deg, #002855, #01223d);
-            padding: 1.2rem 1.6rem;
-            border-radius: 12px;
-            margin-bottom: 1.5rem;
-            display: flex;
-            align-items: center;
-            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18);
-        ">
-            <div style="font-size: 2.4rem; margin-right: 1rem;">🐄</div>
-            <div style="flex: 1;">
-                <div style="
-                    color: #FFBF00;
-                    font-weight: 700;
-                    letter-spacing: 0.16em;
-                    text-transform: uppercase;
-                    font-size: 0.8rem;
-                ">
-                    UC Davis • Yellow Cluster
-                </div>
-                <div style="
-                    color: #FFFFFF;
-                    font-size: 1.5rem;
-                    font-weight: 600;
-                    margin-top: 0.15rem;
-                ">
-                    PI Budget Summary Generator
-                </div>
-                <div style="
-                    color: #d7e3f3;
-                    font-size: 0.9rem;
-                    margin-top: 0.25rem;
-                ">
-                    Generate PI-specific budget summaries for sharing with faculty.
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-def main():
-    ucd_banner()
-    st.markdown("_Written by David Railton Garrett_")
-
-    with st.expander("Debug options", expanded=False):
-        show_trace = st.checkbox("Show full error trace", value=False)
-        show_merge_diagnostics = st.checkbox("Show award-merge diagnostics", value=True)
-        reveal_indirect_for_debug = st.checkbox("TEMP: Show Indirect Rate column in output files", value=False)
-
-    st.markdown(
-        """
-        Upload your **Aggie Enterprise Database** and one or more **Award Info** workbooks.
-
-        Output ZIP is organized by **Project Owning Organization** (first 7 alphanumeric characters):
-        `Org7/<Report Label> - <PI>.xlsx`
-
-        Optional filters:
-        - Filter by **PI** (partial match)
-        - Filter by **Org7** (e.g., `LPSC001`)
-        """
-    )
-
-    master_file = st.file_uploader("Upload Aggie Enterprise Database Excel file", type=["xlsx"])
-    award_files = st.file_uploader("Upload one or more Award Info Excel file(s)", type=["xlsx"], accept_multiple_files=True)
-    date_pulled = st.text_input("Date Pulled (optional)", value="")
-
-    colA, colB = st.columns(2)
-    with colA:
-        pi_filter_input = st.text_input("Optional: Filter by PI", value="")
-    with colB:
-        org_filter_input = st.text_input("Optional: Filter by Owning Org (Org7)", value="")
-
-    if master_file and award_files:
-        if st.button("Run processing", type="primary"):
-            try:
-                master_bytes = master_file.getvalue()
-                award_bytes_list = [f.getvalue() for f in award_files]
-
-                with st.spinner("Processing files..."):
-                    base_name, zip_bytes, summary = process_workbooks_cached(
-                        master_bytes,
-                        award_bytes_list,
-                        date_pulled,
-                        pi_filter_input,
-                        org_filter_input,
-                        show_merge_diagnostics,
-                        reveal_indirect_for_debug,
-                    )
-
-                st.success("Processing complete!")
-                st.markdown("### Summary")
-                st.write(f"- Base filename: **{summary['base_name']}**")
-                st.write(f"- Date Pulled: **{summary['date_pulled']}**")
-                st.write(f"- Total rows included: **{summary['num_rows']}**")
-                st.write(f"- Unique PIs included: **{summary['num_pis']}**")
-                st.write(f"- Org folders included: **{summary['num_org7']}**")
-                if summary["org7_examples"]:
-                    st.write("Examples of Org7 folders:")
-                    st.write(", ".join(summary["org7_examples"]))
-                st.write(
-                    f"- Award merge match rate: **{summary['merge_matched_rows']}/{summary['merge_total_rows']} "
-                    f"({summary['merge_match_rate']:.1%})**"
+            # Combine Project Name + Task Name into Project Name
+            if "Project Name" in df_merged.columns:
+                df_merged["Project Name"] = (
+                    df_merged["Project Name"].apply(safe_str)
+                    + " – "
+                    + df_merged[task_name_col].apply(safe_str)
                 )
 
-                st.download_button(
-                    "Download Budget Summaries (ZIP)",
-                    data=zip_bytes,
-                    file_name=f"{base_name}_PI_files_by_OwningOrg.zip",
-                    mime="application/zip",
-                )
+            # Drop Task columns
+            df_merged = df_merged.drop(columns=[task_name_col, task_num_col], errors="ignore")
 
-            except Exception as e:
-                st.error(f"Error: {e}")
-                if show_trace:
-                    st.code(traceback.format_exc())
-    else:
-        st.info("Please upload both the Aggie Enterprise Database and at least one Award Info file to begin.")
+            # Rename budgets
+            df_merged = df_merged.rename(columns={"Budget": "Allocated Budget", balance_col: "Current Balance"})
 
+            # Compute net-of-indirect
+            df_merged["Indirect Rate"] = pd.to_numeric(df_merged["Indirect Rate"], errors="coerce").fillna(0.0)
+            df_merged["Allocated Budget"] = pd.to_numeric(df_merged["Allocated Budget"], errors="coerce")
+            df_merged["Current Balance"] = pd.to_numeric(df_merged["Current Balance"], errors="coerce")
 
-if __name__ == "__main__":
-    main()
+            denom = 1.0 + df_merged["Indirect Rate"]
+            df_merged[ALLOC_BUDGET_NET_COL] = df_merged["Allocated Budget"] / denom
+            df_merged[CURRENT_BAL_NET_COL] = df_merged["Current Balance"] / denom
+
+            # Drop gross cols
+            df_merged = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
+
+            # Date Pulled
+            if safe_str(date_pulled):
+                df_merged["Date Pulled"] = safe_str(date_pulled)
+
+            # Normalize PI to Last, First (if present)
+            if PI_COL_NAME in df_merged.columns:
+                df_merged[PI_COL_NAME] = df_merged[PI_COL_NAME].apply(normalize_pi_last_first)
+
+            # Reorder (best effort)
+            desired = [
+                PI_COL_NAME,
+                "Project Manager",
+                "Date Pulled",
+                project_col,
+                "Project Name",
+                ALLOC_BUDGET_NET_COL,
+                CURRENT_BAL_NET_COL,
+                "Indirect Rate",
+                "expenses",
+            ]
+            desired = [c for c in desired if c in df_merged.columns]
+            remaining = [c for c in df_merged.columns if c not in desired]
+            df_out = df_merged[desired + remaining]
+
+            out_bytes = build_output_excel(df_out, hide_indirect=hide_indirect_in_output)
+
+            st.success("Output generated!")
+            st.download_button(
+                "Download Budget Summary (Excel)",
+                data=out_bytes,
+                file_name="Budget_Summary.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+        if show_trace:
+            st.code(traceback.format_exc())
+else:
+    st.info("Upload both files to preview and configure the merge.")
