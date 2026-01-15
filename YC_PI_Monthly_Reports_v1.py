@@ -25,20 +25,26 @@ HEADER_ROW_INDEX = 17  # 0-based index: Excel row 18
 
 # Aggie Enterprise Database (master) column identifiers
 PI_COL_NAME = "Project Principal Investigator"
-PROJECT_COL_NAME = "Project Number"  # logical name; actual may vary in export
+PROJECT_COL_NAME = "Project Number"  # logical name; actual may vary
 TASK_NAME_COL_NAME = "Task Name"
 TASK_NUMBER_COL_NAME = "Task Number"
 STATUS_COL_NAME = "Task Status"
 OWNING_ORG_COL_NAME = "Project Owning Organization"
 
-# Award Info columns (confirmed)
+# Award Info columns (preferred, if present)
 AWARD_INFO_PROJECT_COL = "AGGIE ENTERPRISE PROJECT #"
 AWARD_INFO_INDIRECT_COL = "INDIRECT RATE"
+
+# Award Info fallback columns by position (Excel letters: E and L)
+# Zero-based indices: E=4, L=11
+AWARD_PROJECT_COL_IDX = 4
+AWARD_INDIRECT_COL_IDX = 11
 
 # Output labels
 ALLOC_BUDGET_NET_COL = "Allocated Budget*"
 CURRENT_BAL_NET_COL = "Current Balance*"
 BALANCE_EX_INDIRECT_COL = CURRENT_BAL_NET_COL  # used for styling highlight
+
 
 # -----------------------------
 # Helper functions
@@ -285,7 +291,6 @@ def build_zip_by_org7_and_pi(df_merged, base_name, currency_cols, footnote_text,
     used_paths = set()
 
     report_label = base_name.replace("_", " ").strip()
-
     grouped = df_merged.groupby(["_Org7", "_PI_stripped"], sort=True)
 
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -326,6 +331,37 @@ def build_zip_by_org7_and_pi(df_merged, base_name, currency_cols, footnote_text,
     return zip_buf.getvalue()
 
 
+def read_award_info_minimal(award_bytes: bytes) -> pd.DataFrame:
+    """
+    Read Award Info and return a 2-column dataframe with standardized names:
+      - 'AGGIE ENTERPRISE PROJECT #'
+      - 'INDIRECT RATE'
+
+    Uses header names if found, otherwise falls back to Excel column positions:
+      - Column E (index 4) for project #
+      - Column L (index 11) for indirect rate
+    """
+    df_aw = pd.read_excel(BytesIO(award_bytes))
+    df_aw.columns = normalize_columns(df_aw.columns)
+
+    has_named = (AWARD_INFO_PROJECT_COL in df_aw.columns) and (AWARD_INFO_INDIRECT_COL in df_aw.columns)
+    if has_named:
+        out = df_aw[[AWARD_INFO_PROJECT_COL, AWARD_INFO_INDIRECT_COL]].copy()
+        return out
+
+    # fallback to position-based extraction
+    if df_aw.shape[1] <= max(AWARD_PROJECT_COL_IDX, AWARD_INDIRECT_COL_IDX):
+        raise KeyError(
+            "Award Info file does not have enough columns to use the fallback mapping "
+            "(expected at least through column L). "
+            f"Detected columns: {df_aw.shape[1]}"
+        )
+
+    out = df_aw.iloc[:, [AWARD_PROJECT_COL_IDX, AWARD_INDIRECT_COL_IDX]].copy()
+    out.columns = [AWARD_INFO_PROJECT_COL, AWARD_INFO_INDIRECT_COL]
+    return out
+
+
 # -----------------------------
 # Processing (byte-safe for Streamlit Cloud)
 # -----------------------------
@@ -336,6 +372,7 @@ def process_workbooks_bytes(
     pi_filter="",
     org7_filter="",
     show_merge_diagnostics=False,
+    reveal_indirect_for_debug=False,
 ):
     base_name = "Budget_Report"
     prefix = (date_pulled or "").strip()
@@ -345,7 +382,6 @@ def process_workbooks_bytes(
     # ---- Read master summary sheet (no header) ----
     df_raw = pd.read_excel(BytesIO(master_bytes), sheet_name=SUMMARY_SHEET_NAME, header=None)
 
-    # Header handling
     header = df_raw.iloc[HEADER_ROW_INDEX]
     df = df_raw.iloc[HEADER_ROW_INDEX + 1 :].copy()
     df.columns = header
@@ -395,10 +431,10 @@ def process_workbooks_bytes(
     needed_cols = [c for c in needed_cols if c in df_active.columns]
     df_active = df_active[needed_cols].copy()
 
-    # ---- Build canonical project key for merge BEFORE mutating the Project Number display ----
+    # ---- Build canonical project key for merge BEFORE mutating displayed Project Number ----
     df_active["_proj_key"] = df_active[project_col].apply(canon_project_key)
 
-    # Combine Project Number + Task Number into the displayed Project Number column (safe string approach)
+    # Combine Project Number + Task Number into displayed Project Number (safe string approach)
     p = df_active[project_col].astype(str).replace("nan", "").str.replace(".0", "", regex=False).str.strip()
     t = df_active[task_number_col].astype(str).replace("nan", "").str.replace(".0", "", regex=False).str.strip()
     df_active[project_col] = (p + "-" + t).str.strip("-")
@@ -422,25 +458,11 @@ def process_workbooks_bytes(
         }
     )
 
-    # ---- Read award info and canonicalize key using AGGIE ENTERPRISE PROJECT # ----
-    award_dfs = []
-    for b in award_bytes_list:
-        df_aw = pd.read_excel(BytesIO(b))
-        df_aw.columns = normalize_columns(df_aw.columns)
-        award_dfs.append(df_aw)
+    # ---- Read award info with robust header-or-position mapping ----
+    award_dfs = [read_award_info_minimal(b) for b in award_bytes_list]
     award_df = pd.concat(award_dfs, ignore_index=True)
 
-    if AWARD_INFO_PROJECT_COL not in award_df.columns:
-        raise KeyError(
-            f"Expected column '{AWARD_INFO_PROJECT_COL}' not found in Award Info file(s).\n"
-            f"Columns seen: {list(award_df.columns)}"
-        )
-    if AWARD_INFO_INDIRECT_COL not in award_df.columns:
-        raise KeyError(
-            f"Expected column '{AWARD_INFO_INDIRECT_COL}' not found in Award Info file(s).\n"
-            f"Columns seen: {list(award_df.columns)}"
-        )
-
+    # Canonicalize award keys
     award_df["_proj_key"] = award_df[AWARD_INFO_PROJECT_COL].apply(canon_project_key)
     award_df = award_df.drop_duplicates(subset=["_proj_key"], keep="first")
 
@@ -449,9 +471,7 @@ def process_workbooks_bytes(
         award_df[["_proj_key", AWARD_INFO_INDIRECT_COL]],
         on="_proj_key",
         how="left",
-    )
-
-    df_merged = df_merged.rename(columns={AWARD_INFO_INDIRECT_COL: "Indirect Rate"})
+    ).rename(columns={AWARD_INFO_INDIRECT_COL: "Indirect Rate"})
 
     # ---- DIAGNOSTICS: validate merge success ----
     matched = df_merged["Indirect Rate"].notna().sum()
@@ -460,16 +480,20 @@ def process_workbooks_bytes(
 
     if show_merge_diagnostics:
         st.write(f"🔎 Award merge match rate: {matched}/{total} ({match_rate:.1%})")
+
         if match_rate < 0.90:
-            st.warning("Low match rate between Aggie Enterprise and Award Info project keys.")
+            st.warning("Low match rate between Aggie Enterprise and Award Info keys. Samples below:")
             st.write("Sample master _proj_key values:")
             st.write(df_active["_proj_key"].dropna().astype(str).unique()[:15])
             st.write("Sample award _proj_key values:")
             st.write(award_df["_proj_key"].dropna().astype(str).unique()[:15])
-            st.write("Examples of rows with missing Indirect Rate (first 20):")
-            st.dataframe(df_merged[df_merged["Indirect Rate"].isna()].head(20))
 
-    # Keep helper merge key only for debugging, then drop
+            st.write("Examples of rows with missing Indirect Rate (first 20):")
+            st.dataframe(
+                df_merged.loc[df_merged["Indirect Rate"].isna(), ["_proj_key", project_col, "Project Name", "Project Manager"]].head(20)
+            )
+
+    # Drop helper merge key column from output tables
     df_merged = df_merged.drop(columns=["_proj_key"], errors="ignore")
 
     # Compute net-of-indirect columns (treat missing indirect as 0.0)
@@ -495,7 +519,6 @@ def process_workbooks_bytes(
     # Standardize owning org column name
     if owning_org_col != OWNING_ORG_COL_NAME and owning_org_col in df_merged.columns:
         df_merged = df_merged.rename(columns={owning_org_col: OWNING_ORG_COL_NAME})
-
     if OWNING_ORG_COL_NAME not in df_merged.columns:
         raise KeyError(f"'{OWNING_ORG_COL_NAME}' column not found after processing.")
 
@@ -528,13 +551,12 @@ def process_workbooks_bytes(
 
     currency_cols = [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"]
 
-    # Build ZIP (PI-facing: hide Indirect Rate column by default)
     zip_bytes = build_zip_by_org7_and_pi(
         df_merged,
         base_name,
         currency_cols,
         footnote_text,
-        hide_indirect=True,
+        hide_indirect=(not reveal_indirect_for_debug),
     )
 
     summary = {
@@ -552,7 +574,7 @@ def process_workbooks_bytes(
 
 
 @st.cache_data(show_spinner=False)
-def process_workbooks_cached(master_bytes, award_bytes_list, date_pulled, pi_filter, org7_filter, show_merge_diagnostics):
+def process_workbooks_cached(master_bytes, award_bytes_list, date_pulled, pi_filter, org7_filter, show_merge_diagnostics, reveal_indirect_for_debug):
     return process_workbooks_bytes(
         master_bytes,
         award_bytes_list,
@@ -560,6 +582,7 @@ def process_workbooks_cached(master_bytes, award_bytes_list, date_pulled, pi_fil
         pi_filter,
         org7_filter,
         show_merge_diagnostics,
+        reveal_indirect_for_debug,
     )
 
 
@@ -621,6 +644,7 @@ def main():
     with st.expander("Debug options", expanded=False):
         show_trace = st.checkbox("Show full error trace", value=False)
         show_merge_diagnostics = st.checkbox("Show award-merge diagnostics", value=True)
+        reveal_indirect_for_debug = st.checkbox("TEMP: Show Indirect Rate column in output files", value=False)
 
     st.markdown(
         """
@@ -664,6 +688,7 @@ def main():
                         pi_filter_input,
                         org_filter_input,
                         show_merge_diagnostics,
+                        reveal_indirect_for_debug,
                     )
 
                 st.success("Processing complete!")
