@@ -18,24 +18,24 @@ st.set_page_config(
 )
 
 # -----------------------------
-# SETTINGS – YOU CAN EDIT THESE
+# SETTINGS
 # -----------------------------
 SUMMARY_SHEET_NAME = "Summary"
 HEADER_ROW_INDEX = 17  # 0-based index: Excel row 18
 
 # Aggie Enterprise Database (master) column identifiers
 PI_COL_NAME = "Project Principal Investigator"
-PROJECT_COL_NAME = "Project Number"  # logical name; actual may vary
+PROJECT_COL_NAME = "Project Number"  # in your file: column J after dropping first 17 rows
 TASK_NAME_COL_NAME = "Task Name"
 TASK_NUMBER_COL_NAME = "Task Number"
 STATUS_COL_NAME = "Task Status"
 OWNING_ORG_COL_NAME = "Project Owning Organization"
 
-# Award Info columns (preferred, if present)
+# Award Info preferred header names (if present)
 AWARD_INFO_PROJECT_COL = "AGGIE ENTERPRISE PROJECT #"
 AWARD_INFO_INDIRECT_COL = "INDIRECT RATE"
 
-# Award Info fallback columns by position (Excel letters: E and L)
+# Award Info fallback by position (Excel letters E and L)
 # Zero-based indices: E=4, L=11
 AWARD_PROJECT_COL_IDX = 4
 AWARD_INDIRECT_COL_IDX = 11
@@ -43,23 +43,21 @@ AWARD_INDIRECT_COL_IDX = 11
 # Output labels
 ALLOC_BUDGET_NET_COL = "Allocated Budget*"
 CURRENT_BAL_NET_COL = "Current Balance*"
-BALANCE_EX_INDIRECT_COL = CURRENT_BAL_NET_COL  # used for styling highlight
+BALANCE_EX_INDIRECT_COL = CURRENT_BAL_NET_COL  # styling highlight
 
 
 # -----------------------------
-# Helper functions
+# Helpers
 # -----------------------------
 def normalize_columns(cols):
-    """Normalize column names to avoid hidden whitespace/nonbreaking spaces issues."""
+    """Normalize column names to avoid hidden whitespace/nonbreaking spaces."""
     out = []
     for c in cols:
-        s = str(c).replace("\xa0", " ").strip()
-        out.append(s)
+        out.append(str(c).replace("\xa0", " ").strip())
     return out
 
 
 def find_column_by_exact_or_keywords(columns, target_name, keywords=None):
-    """Find column by exact match or by keywords (case-insensitive)."""
     columns = list(columns)
     if target_name in columns:
         return target_name
@@ -71,8 +69,7 @@ def find_column_by_exact_or_keywords(columns, target_name, keywords=None):
                 return col
 
     raise KeyError(
-        f"Could not find a suitable column for '{target_name}'. "
-        f"Available columns: {columns}"
+        f"Could not find a suitable column for '{target_name}'. Available columns: {columns}"
     )
 
 
@@ -93,21 +90,14 @@ def find_project_number_column(columns):
     candidates = []
     for c in columns:
         low = c.lower()
-        if "project" in low and (
-            "number" in low
-            or "#" in low
-            or " id" in low
-            or low.endswith("id")
-            or " no" in low
-            or low.endswith("no")
-        ):
+        if "project" in low and ("number" in low or "#" in low or " id" in low or low.endswith("id") or " no" in low):
             candidates.append(c)
 
     if len(candidates) == 1:
         return candidates[0]
 
     raise KeyError(
-        "Could not uniquely identify the Project Number column in the Aggie Enterprise file.\n"
+        "Could not uniquely identify the Project Number column.\n"
         f"Candidates: {candidates}\n"
         f"All columns: {list(columns)}"
     )
@@ -117,11 +107,12 @@ def canon_project_key(x) -> str:
     """
     Canonicalize project identifiers so Aggie Enterprise + Award Info match.
 
-    Strategy:
-      - Trim / normalize whitespace
-      - If numeric-like (e.g., 12345.0), convert to integer string "12345"
-      - Otherwise, extract FIRST digit-run (e.g., 'AE Project 0012345' -> '12345')
-      - Fall back to alphanumeric-only cleaned string
+    IMPORTANT: must support alphanumeric IDs like SP0A221585, K30BOWISRA.
+
+    Rules:
+    - Trim whitespace / normalize
+    - If purely numeric-like -> normalize 12345.0 -> '12345'
+    - Else -> keep full alphanumeric content (remove punctuation/spaces), uppercase
     """
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return ""
@@ -130,29 +121,20 @@ def canon_project_key(x) -> str:
     if not s:
         return ""
 
-    # numeric-like? normalize 12345.0 -> 12345
+    # numeric-like?
     try:
         f = float(s)
         if f.is_integer():
             return str(int(f))
-    except ValueError:
+    except Exception:
         pass
 
-    # extract digit run
-    m = re.search(r"(\d+)", s)
-    if m:
-        digits = m.group(1)
-        try:
-            return str(int(digits))  # strips leading zeros
-        except ValueError:
-            return digits
-
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", s)
+    # keep full alphanumeric code (critical for SP0A..., K30..., etc.)
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", s).upper()
     return cleaned
 
 
 def make_safe_filename_fragment(name: str) -> str:
-    """Filesystem-safe fragment for filenames/folders (<=80 chars)."""
     frag = str(name)
     for ch in r'\/:*?"<>|':
         frag = frag.replace(ch, "_")
@@ -167,7 +149,6 @@ def normalize_pi_name(pi: str) -> str:
         return "Unknown PI"
     if "," in pi:
         return pi
-
     parts = pi.split()
     if len(parts) >= 2:
         first = " ".join(parts[:-1])
@@ -177,33 +158,28 @@ def normalize_pi_name(pi: str) -> str:
 
 
 def compute_org7(value) -> str:
-    """
-    Folder key from Project Owning Organization:
-      - Keep alphanumeric only
-      - Take first 7 chars (e.g., 'LPSC001')
-    """
+    """Folder key from Project Owning Organization: first 7 alnum chars, uppercase."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "UnknownOrg"
     s = str(value).replace("\xa0", " ").strip()
     if not s:
         return "UnknownOrg"
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", s)
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", s).upper()
     if len(cleaned) >= 7:
-        return cleaned[:7].upper()
-    return cleaned.upper() if cleaned else "UnknownOrg"
+        return cleaned[:7]
+    return cleaned if cleaned else "UnknownOrg"
 
 
 def apply_currency_format(workbook, sheet_name, columns):
-    """Apply USD currency formatting to specified header-named columns."""
     ws = workbook[sheet_name]
     header_row = next(ws.iter_rows(min_row=1, max_row=1))
 
-    header_to_col_letter = {}
+    header_to_letter = {}
     for cell in header_row:
         if cell.value in columns:
-            header_to_col_letter[cell.value] = cell.column_letter
+            header_to_letter[cell.value] = cell.column_letter
 
-    for _, col_letter in header_to_col_letter.items():
+    for _, col_letter in header_to_letter.items():
         for cell in ws[col_letter]:
             if cell.row == 1:
                 continue
@@ -211,16 +187,6 @@ def apply_currency_format(workbook, sheet_name, columns):
 
 
 def style_sheet(workbook, sheet_name, currency_cols, footnote_text, hide_indirect=True):
-    """
-    Style output sheet:
-      - currency formatting
-      - alternating row shading
-      - highlight Current Balance* header
-      - color-code Current Balance* values
-      - dynamic column widths
-      - optionally hide Indirect Rate
-      - add footnote
-    """
     ws = workbook[sheet_name]
 
     apply_currency_format(workbook, sheet_name, currency_cols)
@@ -258,7 +224,7 @@ def style_sheet(workbook, sheet_name, currency_cols, footnote_text, hide_indirec
                     color = "8B0000"
                 elif v > 0:
                     color = "004B00"
-            except (TypeError, ValueError):
+            except Exception:
                 pass
 
             if color:
@@ -333,27 +299,23 @@ def build_zip_by_org7_and_pi(df_merged, base_name, currency_cols, footnote_text,
 
 def read_award_info_minimal(award_bytes: bytes) -> pd.DataFrame:
     """
-    Read Award Info and return a 2-column dataframe with standardized names:
+    Read Award Info and return standardized 2-column dataframe:
       - 'AGGIE ENTERPRISE PROJECT #'
       - 'INDIRECT RATE'
 
-    Uses header names if found, otherwise falls back to Excel column positions:
+    Uses headers if present; otherwise uses Excel positions:
       - Column E (index 4) for project #
       - Column L (index 11) for indirect rate
     """
     df_aw = pd.read_excel(BytesIO(award_bytes))
     df_aw.columns = normalize_columns(df_aw.columns)
 
-    has_named = (AWARD_INFO_PROJECT_COL in df_aw.columns) and (AWARD_INFO_INDIRECT_COL in df_aw.columns)
-    if has_named:
-        out = df_aw[[AWARD_INFO_PROJECT_COL, AWARD_INFO_INDIRECT_COL]].copy()
-        return out
+    if (AWARD_INFO_PROJECT_COL in df_aw.columns) and (AWARD_INFO_INDIRECT_COL in df_aw.columns):
+        return df_aw[[AWARD_INFO_PROJECT_COL, AWARD_INFO_INDIRECT_COL]].copy()
 
-    # fallback to position-based extraction
     if df_aw.shape[1] <= max(AWARD_PROJECT_COL_IDX, AWARD_INDIRECT_COL_IDX):
         raise KeyError(
-            "Award Info file does not have enough columns to use the fallback mapping "
-            "(expected at least through column L). "
+            "Award Info file does not have enough columns to use fallback (E and L). "
             f"Detected columns: {df_aw.shape[1]}"
         )
 
@@ -363,7 +325,7 @@ def read_award_info_minimal(award_bytes: bytes) -> pd.DataFrame:
 
 
 # -----------------------------
-# Processing (byte-safe for Streamlit Cloud)
+# Processing (Streamlit Cloud friendly)
 # -----------------------------
 def process_workbooks_bytes(
     master_bytes,
@@ -388,9 +350,9 @@ def process_workbooks_bytes(
     df = df.dropna(how="all")
     df.columns = normalize_columns(df.columns)
 
-    # Identify columns (robust project col)
+    # Identify columns
     pi_col = find_column_by_exact_or_keywords(df.columns, PI_COL_NAME, keywords=["principal", "investigator"])
-    project_col = find_project_number_column(df.columns)
+    project_col = find_project_number_column(df.columns)  # should resolve to "Project Number"
     task_name_col = find_column_by_exact_or_keywords(df.columns, TASK_NAME_COL_NAME, keywords=["task", "name"])
     task_number_col = find_column_by_exact_or_keywords(df.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"])
     status_col = find_column_by_exact_or_keywords(df.columns, STATUS_COL_NAME, keywords=["task", "status"])
@@ -410,8 +372,7 @@ def process_workbooks_bytes(
     if df_active.empty:
         raise ValueError("No rows found with Task Status == 'Active'.")
 
-    # Sort
-    df_active[project_col] = pd.to_numeric(df_active[project_col], errors="coerce")
+    # Sort (DO NOT coerce Project Number to numeric; it is alphanumeric in your file)
     df_active[task_number_col] = pd.to_numeric(df_active[task_number_col], errors="coerce")
     df_active = df_active.sort_values(by=[pi_col, project_col, task_number_col], na_position="last")
 
@@ -431,10 +392,10 @@ def process_workbooks_bytes(
     needed_cols = [c for c in needed_cols if c in df_active.columns]
     df_active = df_active[needed_cols].copy()
 
-    # ---- Build canonical project key for merge BEFORE mutating displayed Project Number ----
+    # Merge key BEFORE mutating Project Number display
     df_active["_proj_key"] = df_active[project_col].apply(canon_project_key)
 
-    # Combine Project Number + Task Number into displayed Project Number (safe string approach)
+    # Combine Project Number + Task Number into displayed Project Number
     p = df_active[project_col].astype(str).replace("nan", "").str.replace(".0", "", regex=False).str.strip()
     t = df_active[task_number_col].astype(str).replace("nan", "").str.replace(".0", "", regex=False).str.strip()
     df_active[project_col] = (p + "-" + t).str.strip("-")
@@ -447,7 +408,7 @@ def process_workbooks_bytes(
             + df_active[task_name_col].astype(str).str.strip()
         )
 
-    # Drop task columns from output
+    # Drop task columns
     df_active = df_active.drop(columns=[task_name_col, task_number_col], errors="ignore")
 
     # Rename budget columns
@@ -458,45 +419,41 @@ def process_workbooks_bytes(
         }
     )
 
-    # ---- Read award info with robust header-or-position mapping ----
+    # ---- Read award info (E + L fallback) ----
     award_dfs = [read_award_info_minimal(b) for b in award_bytes_list]
     award_df = pd.concat(award_dfs, ignore_index=True)
 
-    # Canonicalize award keys
+    # Canonicalize award key using FULL alphanumeric codes (matches SP0A..., K30..., etc.)
     award_df["_proj_key"] = award_df[AWARD_INFO_PROJECT_COL].apply(canon_project_key)
     award_df = award_df.drop_duplicates(subset=["_proj_key"], keep="first")
 
-    # Merge indirect rate
+    # Merge
     df_merged = df_active.merge(
         award_df[["_proj_key", AWARD_INFO_INDIRECT_COL]],
         on="_proj_key",
         how="left",
-    ).rename(columns={AWARD_INFO_INDIRECT_COL: "Indirect Rate"})
+    ).rename(columns={AWARD_INDIRECT_COL_IDX: "Indirect Rate", AWARD_INFO_INDIRECT_COL: "Indirect Rate"})
 
-    # ---- DIAGNOSTICS: validate merge success ----
+    # Diagnostics
     matched = df_merged["Indirect Rate"].notna().sum()
     total = len(df_merged)
     match_rate = matched / total if total else 0.0
 
     if show_merge_diagnostics:
         st.write(f"🔎 Award merge match rate: {matched}/{total} ({match_rate:.1%})")
-
         if match_rate < 0.90:
-            st.warning("Low match rate between Aggie Enterprise and Award Info keys. Samples below:")
-            st.write("Sample master _proj_key values:")
+            st.warning("Low match rate between Aggie Enterprise Project Number and Award Info AE Project #.")
+            st.write("Sample master keys:")
             st.write(df_active["_proj_key"].dropna().astype(str).unique()[:15])
-            st.write("Sample award _proj_key values:")
+            st.write("Sample award keys:")
             st.write(award_df["_proj_key"].dropna().astype(str).unique()[:15])
+            st.write("Rows missing Indirect Rate (first 20):")
+            st.dataframe(df_merged[df_merged["Indirect Rate"].isna()].head(20))
 
-            st.write("Examples of rows with missing Indirect Rate (first 20):")
-            st.dataframe(
-                df_merged.loc[df_merged["Indirect Rate"].isna(), ["_proj_key", project_col, "Project Name", "Project Manager"]].head(20)
-            )
-
-    # Drop helper merge key column from output tables
+    # Drop merge key from output
     df_merged = df_merged.drop(columns=["_proj_key"], errors="ignore")
 
-    # Compute net-of-indirect columns (treat missing indirect as 0.0)
+    # Compute net-of-indirect columns (missing indirect => 0)
     df_merged["Indirect Rate"] = pd.to_numeric(df_merged["Indirect Rate"], errors="coerce").fillna(0.0)
     df_merged["Allocated Budget"] = pd.to_numeric(df_merged["Allocated Budget"], errors="coerce")
     df_merged["Current Balance"] = pd.to_numeric(df_merged["Current Balance"], errors="coerce")
@@ -505,10 +462,10 @@ def process_workbooks_bytes(
     df_merged[ALLOC_BUDGET_NET_COL] = df_merged["Allocated Budget"] / denom
     df_merged[CURRENT_BAL_NET_COL] = df_merged["Current Balance"] / denom
 
-    # Drop gross columns from PI-facing output
+    # Drop gross columns
     df_merged = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
 
-    # Standardize PI column name
+    # Standardize PI col
     if pi_col in df_merged.columns and pi_col != "Principal Investigator":
         df_merged = df_merged.rename(columns={pi_col: "Principal Investigator"})
         pi_col = "Principal Investigator"
@@ -516,7 +473,7 @@ def process_workbooks_bytes(
     df_merged["_PI_stripped"] = df_merged[pi_col].astype(str).apply(normalize_pi_name)
     df_merged[pi_col] = df_merged["_PI_stripped"]
 
-    # Standardize owning org column name
+    # Standardize owning org col
     if owning_org_col != OWNING_ORG_COL_NAME and owning_org_col in df_merged.columns:
         df_merged = df_merged.rename(columns={owning_org_col: OWNING_ORG_COL_NAME})
     if OWNING_ORG_COL_NAME not in df_merged.columns:
@@ -524,25 +481,23 @@ def process_workbooks_bytes(
 
     df_merged["_Org7"] = df_merged[OWNING_ORG_COL_NAME].apply(compute_org7)
 
-    # Optional date pulled
+    # Date pulled
     if prefix:
         df_merged["Date Pulled"] = prefix
 
-    # Optional filters (substring for PI; exact for Org7)
+    # Filters
     pi_query = (pi_filter or "").strip().lower()
     org_query = (org7_filter or "").strip().upper()
 
     if pi_query:
-        df_merged = df_merged[
-            df_merged["_PI_stripped"].astype(str).str.lower().str.contains(pi_query, na=False)
-        ]
+        df_merged = df_merged[df_merged["_PI_stripped"].astype(str).str.lower().str.contains(pi_query, na=False)]
     if org_query:
         df_merged = df_merged[df_merged["_Org7"].astype(str).str.upper() == org_query]
 
     if df_merged.empty:
         raise ValueError("No records matched your filter(s). Clear filters or try different values.")
 
-    # Footnote text (single indirect rate? show it; otherwise generic)
+    # Footnote
     unique_rates = pd.Series(df_merged["Indirect Rate"].dropna().unique())
     if len(unique_rates) == 1:
         footnote_text = f"* Calculated minus the indirect costs (Indirect Rate = {float(unique_rates.iloc[0]):.2%})."
@@ -660,12 +615,7 @@ def main():
     )
 
     master_file = st.file_uploader("Upload Aggie Enterprise Database Excel file", type=["xlsx"])
-    award_files = st.file_uploader(
-        "Upload one or more Award Info Excel file(s)",
-        type=["xlsx"],
-        accept_multiple_files=True,
-    )
-
+    award_files = st.file_uploader("Upload one or more Award Info Excel file(s)", type=["xlsx"], accept_multiple_files=True)
     date_pulled = st.text_input("Date Pulled (optional)", value="")
 
     colA, colB = st.columns(2)
