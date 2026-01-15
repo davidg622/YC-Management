@@ -322,9 +322,9 @@ if master_file and award_file:
         df_award = read_award(award_bytes, sheet_name=award_sheet)
 
         # Option: filter master to Active by default
-        do_active_only = st.checkbox("Master: keep only Task Status == Active", value=True)
-        status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["task", "status"])
-        df_master_view = df_master[df_master[status_col] == "Active"].copy() if do_active_only else df_master.copy()
+        do_active_only = st.checkbox("Master: keep only Project Status == ACTIVE", value=True)
+        status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["project", "status"])
+        df_master_view = df_master[df_master[status_col] == "ACTIVE"].copy() if do_active_only else df_master.copy()
 
         st.markdown("### Preview (before merge)")
         c1, c2 = st.columns(2)
