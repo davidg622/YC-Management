@@ -9,7 +9,7 @@ from openpyxl.styles import Font, PatternFill, numbers
 from openpyxl.utils import get_column_letter
 
 # ============================================================
-# Yellow Cluster: Budget Summary (Merge Debugger + Per-PI ZIP)
+# Yellow Cluster: Budget Summary Generator
 # - Preview both files BEFORE merge
 # - Let user SELECT merge columns for Master and Award
 # - Show match-rate diagnostics (keys overlap + unmatched samples)
@@ -21,7 +21,7 @@ from openpyxl.utils import get_column_letter
 # PAGE CONFIG (must be first Streamlit call)
 # -----------------------------
 st.set_page_config(
-    page_title="Yellow Cluster: Budget Summary (Per-PI ZIP)",
+    page_title="Yellow Cluster: Budget Summary Generator",
     page_icon="🐄",
     layout="wide",
 )
@@ -514,9 +514,9 @@ if master_file and award_file:
             remaining = [c for c in df_merged.columns if c not in desired]
             df_out = df_merged[desired + remaining]
 
-            report_label = "Budget Summary"
+            report_label = "Budget Report"
             if date_label:
-                report_label = f"{date_label} Budget Summary"
+                report_label = f"{date_label} Budget Report"
 
             # Build ZIP
             zip_bytes = build_pi_zip(
