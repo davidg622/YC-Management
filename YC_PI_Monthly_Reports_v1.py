@@ -312,7 +312,7 @@ st.markdown(
     <div style="padding: 1rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 1rem;">
       <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
       <div style="opacity: 0.85; margin-top: 0.25rem;">
-        Preview both files, choose merge columns, validate match rate, then download one ZIP with one Excel file per PI.
+        Creates a budget report for all accounts for a given PI, using both the Aggie Enterprise database, and a document denoting the Indirect Rates.
       </div>
     </div>
     """,
