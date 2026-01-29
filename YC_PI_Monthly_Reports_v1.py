@@ -213,23 +213,33 @@ def style_sheet(wb, ws_name, currency_cols, footnote_text, hide_indirect=True):
     ws[f"A{footer_row}"].font = Font(italic=True, size=10)
 
 
-def read_aggy_master(master_bytes: bytes) -> pd.DataFrame:
+def read_aggy_master(master_bytes: bytes):
     """
     Reads Aggie Enterprise Database:
-      - Uses the FIRST sheet in the workbook (the default/open sheet)
-      - Reads with header=None, then uses row 18 as header (index 17)
+      - Sheet 'Summary'
+      - Extracts report run date from A3 BEFORE header trimming
+      - Uses row 18 as header (0-based index 17)
+    Returns:
+      df, report_date (YYYY-MM-DD or "")
     """
-    xl = pd.ExcelFile(BytesIO(master_bytes))
-    first_sheet = xl.sheet_names[0]  # <-- first tab
+    df_raw = pd.read_excel(BytesIO(master_bytes), sheet_name=SUMMARY_SHEET_NAME, header=None)
 
-    df_raw = pd.read_excel(xl, sheet_name=first_sheet, header=None)
+    # Extract report date from raw A3 (row 2, col 0)
+    report_cell = None
+    try:
+        report_cell = df_raw.iat[REPORT_RUNDATE_ROW0, REPORT_RUNDATE_COL0]
+    except Exception:
+        report_cell = None
+    report_date = extract_report_run_date_from_cell(report_cell)
 
+    # Now trim to header row
     header = df_raw.iloc[HEADER_ROW_INDEX]
     df = df_raw.iloc[HEADER_ROW_INDEX + 1 :].copy()
     df.columns = header
     df = df.dropna(how="all")
     df.columns = normalize_columns(df.columns)
-    return df
+    return df, report_date
+
 
 def read_award(award_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     xl = pd.ExcelFile(BytesIO(award_bytes))
