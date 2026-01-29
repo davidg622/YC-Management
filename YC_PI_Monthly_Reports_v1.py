@@ -325,7 +325,7 @@ with st.expander("Debug options", expanded=False):
     show_key_samples = st.checkbox("Show key samples from both files", value=True)
 
 master_file = st.file_uploader("Upload Aggie Enterprise Database (Excel)", type=["xlsx"])
-award_file = st.file_uploader("Upload Award Info Document(Excel)", type=["xlsx"])
+award_file = st.file_uploader("Upload Award Info Document (Excel)", type=["xlsx"])
 
 hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in resulting download", value=True)
 
