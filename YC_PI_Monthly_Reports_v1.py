@@ -16,6 +16,8 @@ from openpyxl.utils import get_column_letter
 # - Generate ONE ZIP containing ONE Excel file PER PI
 #   (no organization sorting / no folders)
 # - Sort each PI report by Allocated Budget* (descending)
+# - Auto-read "Report Run Date" from Master (cell A3 before header trimming)
+#   Example: "Report Run Date: 2026-01-15 8:43:21 AM" -> "2026-01-15"
 # ============================================================
 
 # -----------------------------
@@ -32,6 +34,11 @@ st.set_page_config(
 # -----------------------------
 SUMMARY_SHEET_NAME = "Summary"
 HEADER_ROW_INDEX = 17  # 0-based index: Excel row 18 (i.e., delete first 17 rows)
+
+# Where the report run date lives BEFORE trimming:
+# "third row of column A" => Excel A3 => 0-based row 2, col 0
+REPORT_RUNDATE_ROW0 = 2
+REPORT_RUNDATE_COL0 = 0
 
 # Master (Aggie) column identifiers we use for the final output
 PI_COL_NAME = "Project Principal Investigator"
@@ -58,6 +65,18 @@ def safe_str(x) -> str:
     return str(x).replace("\xa0", " ").strip()
 
 
+def extract_report_run_date_from_cell(val) -> str:
+    """
+    Expected like: "Report Run Date: 2026-01-15 8:43:21 AM"
+    Returns: "2026-01-15" (date only) or "" if not found
+    """
+    s = safe_str(val)
+    if not s:
+        return ""
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+    return m.group(1) if m else ""
+
+
 def canon_key(x) -> str:
     """
     Canonicalize merge keys without destroying alphanumeric IDs.
@@ -70,7 +89,6 @@ def canon_key(x) -> str:
     if not s:
         return ""
 
-    # numeric-like?
     try:
         f = float(s)
         if f.is_integer():
@@ -111,9 +129,6 @@ def normalize_pi_last_first(pi_val: str) -> str:
 
 
 def make_safe_filename_fragment(name: str) -> str:
-    """
-    Filesystem-safe fragment for filenames.
-    """
     frag = safe_str(name)
     frag = re.sub(r'[\/:*?"<>|]+', "_", frag)
     frag = frag.strip().strip(".")
@@ -198,19 +213,32 @@ def style_sheet(wb, ws_name, currency_cols, footnote_text, hide_indirect=True):
     ws[f"A{footer_row}"].font = Font(italic=True, size=10)
 
 
-def read_aggy_master(master_bytes: bytes) -> pd.DataFrame:
+def read_aggy_master(master_bytes: bytes):
     """
     Reads Aggie Enterprise Database:
       - Sheet 'Summary'
+      - Extracts report run date from A3 BEFORE header trimming
       - Uses row 18 as header (0-based index 17)
+    Returns:
+      df, report_date (YYYY-MM-DD or "")
     """
     df_raw = pd.read_excel(BytesIO(master_bytes), sheet_name=SUMMARY_SHEET_NAME, header=None)
+
+    # Extract report date from raw A3 (row 2, col 0)
+    report_cell = None
+    try:
+        report_cell = df_raw.iat[REPORT_RUNDATE_ROW0, REPORT_RUNDATE_COL0]
+    except Exception:
+        report_cell = None
+    report_date = extract_report_run_date_from_cell(report_cell)
+
+    # Now trim to header row
     header = df_raw.iloc[HEADER_ROW_INDEX]
     df = df_raw.iloc[HEADER_ROW_INDEX + 1 :].copy()
     df.columns = header
     df = df.dropna(how="all")
     df.columns = normalize_columns(df.columns)
-    return df
+    return df, report_date
 
 
 def read_award(award_bytes: bytes, sheet_name: str) -> pd.DataFrame:
@@ -245,8 +273,8 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
                 group[ALLOC_BUDGET_NET_COL] = pd.to_numeric(group[ALLOC_BUDGET_NET_COL], errors="coerce")
                 group = group.sort_values(by=ALLOC_BUDGET_NET_COL, ascending=False, na_position="last")
 
-            # Footnote per PI (if one indirect rate)
-                footnote = "* Calculated minus the indirect costs, if applicable."
+            # Footnote (simple)
+            footnote = "* Calculated minus the indirect costs, if applicable."
 
             currency_cols = [c for c in [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"] if c in group.columns]
 
@@ -299,7 +327,6 @@ with st.expander("Debug options", expanded=False):
 master_file = st.file_uploader("Upload Aggie Enterprise Database (Excel)", type=["xlsx"])
 award_file = st.file_uploader("Upload Award Info (Excel)", type=["xlsx"])
 
-date_pulled = st.text_input("Date Pulled (optional)", value="")
 hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in PI files", value=True)
 
 if master_file and award_file:
@@ -307,14 +334,22 @@ if master_file and award_file:
         master_bytes = master_file.getvalue()
         award_bytes = award_file.getvalue()
 
-        # Read both
-        df_master = read_aggy_master(master_bytes)
+        # Read both (and extract report date from master A3)
+        df_master, report_date = read_aggy_master(master_bytes)
+
+        # If we couldn't parse the date, allow a manual fallback
+        if report_date:
+            st.info(f"Detected report run date from Master (A3): **{report_date}**")
+            date_label = report_date
+        else:
+            st.warning("Could not detect 'Report Run Date' from Master cell A3. Enter a date manually.")
+            date_label = st.text_input("Report Date (YYYY-MM-DD)", value="")
 
         xl_aw = pd.ExcelFile(BytesIO(award_bytes))
         award_sheet = st.selectbox("Award sheet to use", options=xl_aw.sheet_names, index=0)
         df_award = read_award(award_bytes, sheet_name=award_sheet)
 
-        # Option: filter master to Active by default
+        # Option: filter master to ACTIVE by default
         do_active_only = st.checkbox("Master: keep only Project Status == ACTIVE", value=True)
         status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["project", "status"])
         df_master_view = df_master[df_master[status_col] == "ACTIVE"].copy() if do_active_only else df_master.copy()
@@ -404,9 +439,15 @@ if master_file and award_file:
         if st.button("Generate ZIP (one Excel per PI)", type="primary"):
             df_work_full = df_master_view.copy()
 
-            project_col = find_column_by_exact_or_keywords(df_work_full.columns, PROJECT_COL_NAME, keywords=["project", "number"])
-            task_name_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NAME_COL_NAME, keywords=["task", "name"])
-            task_num_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"])
+            project_col = find_column_by_exact_or_keywords(
+                df_work_full.columns, PROJECT_COL_NAME, keywords=["project", "number"]
+            )
+            task_name_col = find_column_by_exact_or_keywords(
+                df_work_full.columns, TASK_NAME_COL_NAME, keywords=["task", "name"]
+            )
+            task_num_col = find_column_by_exact_or_keywords(
+                df_work_full.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"]
+            )
 
             balance_candidates = [c for c in df_work_full.columns if str(c).startswith("Budget Balance")]
             if not balance_candidates:
@@ -443,12 +484,17 @@ if master_file and award_file:
 
             matched_rows = df_merged["Indirect Rate"].notna().sum()
             total_rows = len(df_merged)
-            st.info(f"Row-level merge match: {matched_rows}/{total_rows} ({(matched_rows/total_rows if total_rows else 0):.1%})")
+            st.info(
+                f"Row-level merge match: {matched_rows}/{total_rows} "
+                f"({(matched_rows/total_rows if total_rows else 0):.1%})"
+            )
 
+            # Combine Project Number + Task Number in Project Number column
             p = df_merged[project_col].apply(safe_str).str.replace(".0", "", regex=False)
             t = df_merged[task_num_col].apply(safe_str).str.replace(".0", "", regex=False)
             df_merged[project_col] = (p + "-" + t).str.strip("-")
 
+            # Combine Project Name + Task Name into Project Name
             if "Project Name" in df_merged.columns:
                 df_merged["Project Name"] = (
                     df_merged["Project Name"].apply(safe_str)
@@ -456,10 +502,13 @@ if master_file and award_file:
                     + df_merged[task_name_col].apply(safe_str)
                 )
 
+            # Drop Task columns
             df_merged = df_merged.drop(columns=[task_name_col, task_num_col], errors="ignore")
 
+            # Rename budgets
             df_merged = df_merged.rename(columns={"Budget": "Allocated Budget", balance_col: "Current Balance"})
 
+            # Compute net-of-indirect
             df_merged["Indirect Rate"] = pd.to_numeric(df_merged["Indirect Rate"], errors="coerce").fillna(0.0)
             df_merged["Allocated Budget"] = pd.to_numeric(df_merged["Allocated Budget"], errors="coerce")
             df_merged["Current Balance"] = pd.to_numeric(df_merged["Current Balance"], errors="coerce")
@@ -468,16 +517,21 @@ if master_file and award_file:
             df_merged[ALLOC_BUDGET_NET_COL] = df_merged["Allocated Budget"] / denom
             df_merged[CURRENT_BAL_NET_COL] = df_merged["Current Balance"] / denom
 
+            # Drop gross cols
             df_merged = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
 
-            date_label = safe_str(date_pulled)
-            if date_label:
-                df_merged["Date Pulled"] = date_label
+            # Always use detected report date (or manual fallback)
+            if safe_str(date_label):
+                df_merged["Date Pulled"] = safe_str(date_label)
 
+            # Normalize PI to Last, First
             if PI_COL_NAME not in df_merged.columns:
-                raise KeyError(f"PI column '{PI_COL_NAME}' not found in master. Columns: {list(df_merged.columns)}")
+                raise KeyError(
+                    f"PI column '{PI_COL_NAME}' not found in master. Columns: {list(df_merged.columns)}"
+                )
             df_merged[PI_COL_NAME] = df_merged[PI_COL_NAME].apply(normalize_pi_last_first)
 
+            # Reorder (best effort)
             desired = [
                 PI_COL_NAME,
                 "Project Manager",
@@ -494,8 +548,8 @@ if master_file and award_file:
             df_out = df_merged[desired + remaining]
 
             report_label = "Budget Report"
-            if date_label:
-                report_label = f"{date_label} Budget Report"
+            if safe_str(date_label):
+                report_label = f"{safe_str(date_label)} Budget Report"
 
             zip_bytes = build_pi_zip(
                 df_out=df_out,
