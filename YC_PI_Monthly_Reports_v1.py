@@ -313,7 +313,7 @@ st.markdown(
       <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
       <div style="opacity: 0.85; margin-top: 0.25rem;">
         Creates a budget report for all accounts for a given PI, using both the Aggie Enterprise database and a document denoting the Indirect Rates.
-        Forward any bug reports to David Garrett (drgarrett@ucdavis.edu)
+        \r Forward any bug reports to David Garrett (drgarrett@ucdavis.edu)
       </div>
     </div>
     """,
