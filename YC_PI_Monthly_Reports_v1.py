@@ -325,9 +325,9 @@ with st.expander("Debug options", expanded=False):
     show_key_samples = st.checkbox("Show key samples from both files", value=True)
 
 master_file = st.file_uploader("Upload Aggie Enterprise Database (Excel)", type=["xlsx"])
-award_file = st.file_uploader("Upload Award Info (Excel)", type=["xlsx"])
+award_file = st.file_uploader("Upload Award Info Document(Excel)", type=["xlsx"])
 
-hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in PI files", value=True)
+hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in resulting download", value=True)
 
 if master_file and award_file:
     try:
@@ -339,10 +339,10 @@ if master_file and award_file:
 
         # If we couldn't parse the date, allow a manual fallback
         if report_date:
-            st.info(f"Detected report run date from Master (A3): **{report_date}**")
+            st.info(f"Aggie Enterprise download date: **{report_date}**")
             date_label = report_date
         else:
-            st.warning("Could not detect 'Report Run Date' from Master cell A3. Enter a date manually.")
+            st.warning("Could not detect 'Report Run Date', please enter a date manually.")
             date_label = st.text_input("Report Date (YYYY-MM-DD)", value="")
 
         xl_aw = pd.ExcelFile(BytesIO(award_bytes))
@@ -350,21 +350,21 @@ if master_file and award_file:
         df_award = read_award(award_bytes, sheet_name=award_sheet)
 
         # Option: filter master to ACTIVE by default
-        do_active_only = st.checkbox("Master: keep only Project Status == ACTIVE", value=True)
+        do_active_only = st.checkbox("Keep only ACTIVE Projects", value=True)
         status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["project", "status"])
         df_master_view = df_master[df_master[status_col] == "ACTIVE"].copy() if do_active_only else df_master.copy()
 
         st.markdown("### Preview (before merge)")
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**Aggie Enterprise (Master) preview**")
+            st.markdown("**Aggie Enterprise preview**")
             st.dataframe(df_master_view.head(25), use_container_width=True)
         with c2:
             st.markdown("**Award Info preview**")
             st.dataframe(df_award.head(25), use_container_width=True)
 
         st.markdown("---")
-        st.markdown("### Choose merge columns")
+        st.markdown("### Choose which columns to merge by:")
 
         default_master_merge = PROJECT_COL_NAME if PROJECT_COL_NAME in df_master_view.columns else df_master_view.columns[0]
 
@@ -377,12 +377,12 @@ if master_file and award_file:
             default_aw_merge = df_award.columns[0]
 
         master_merge_col = st.selectbox(
-            "Master merge column",
+            "Aggie Enterprise merge column",
             options=list(df_master_view.columns),
             index=list(df_master_view.columns).index(default_master_merge) if default_master_merge in df_master_view.columns else 0,
         )
         award_merge_col = st.selectbox(
-            "Award merge column",
+            "Award Document merge column",
             options=list(df_award.columns),
             index=list(df_award.columns).index(default_aw_merge) if default_aw_merge in df_award.columns else 0,
         )
@@ -397,7 +397,7 @@ if master_file and award_file:
             default_aw_rate = indirect_candidates[0] if indirect_candidates else df_award.columns[-1]
 
         award_rate_col = st.selectbox(
-            "Award indirect-rate column",
+            "Award Document indirect-rate column",
             options=list(df_award.columns),
             index=list(df_award.columns).index(default_aw_rate) if default_aw_rate in df_award.columns else 0,
         )
@@ -412,13 +412,13 @@ if master_file and award_file:
         match_rate_unique = (len(intersect) / len(master_key_set)) if master_key_set else 0.0
 
         st.markdown("### Merge preview")
-        st.write(f"**Unique master keys:** {len(master_key_set)}")
-        st.write(f"**Unique award keys:** {len(award_key_set)}")
-        st.write(f"**Key overlap (unique):** {len(intersect)}")
+        st.write(f"**# of Aggie Enterprise Projects:** {len(master_key_set)}")
+        st.write(f"**# of Award Info Sheet Projects:** {len(award_key_set)}")
+        st.write(f"**# that match:** {len(intersect)}")
         st.write(f"**Approx. match rate (unique master keys found in award):** {match_rate_unique:.1%}")
 
         if show_key_samples:
-            st.markdown("**Key samples (canonicalized)**")
+            st.markdown("**Project # Samples:**")
             c3, c4 = st.columns(2)
             with c3:
                 st.caption("Master key sample")
@@ -430,7 +430,7 @@ if master_file and award_file:
         if show_unmatched:
             missing = sorted(list(master_key_set - award_key_set))[:40]
             if missing:
-                st.warning("Some master keys were not found in award keys (sample):")
+                st.warning("Some Aggie Enterprise project were not found in the Award document:")
                 st.code(", ".join(missing[:40]))
 
         st.markdown("---")
@@ -451,7 +451,7 @@ if master_file and award_file:
 
             balance_candidates = [c for c in df_work_full.columns if str(c).startswith("Budget Balance")]
             if not balance_candidates:
-                raise KeyError("Master is missing a column starting with 'Budget Balance'.")
+                raise KeyError("Aggie Enterprise document is missing a column starting with 'Budget Balance'.")
             balance_col = balance_candidates[0]
 
             keep_cols = []
