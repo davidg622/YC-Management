@@ -511,7 +511,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown("### Step 1 — Choose database type")
+st.markdown("## Choose database type")
 db_type = st.radio(
     "Which database are you uploading?",
     options=["PPM", "GL"],
@@ -527,7 +527,7 @@ with st.expander("Debug options", expanded=False):
     show_key_samples = st.checkbox("Show key samples from both files", value=True)
 
 db_file = st.file_uploader(
-    "Upload PPM Database (Aggie Enterprise / PPM export)"
+    "Upload PPM Database (Aggie Enterprise)"
     if db_type == "PPM"
     else "Upload GL Database (General Ledger export)",
     type=["xlsx"],
