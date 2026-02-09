@@ -16,6 +16,7 @@ from openpyxl.utils import get_column_letter
 # - Award Info Document is OPTIONAL (PPM only)
 #     * If not provided: no indirect calculations (gross used)
 #     * If provided: merge + net-of-indirect calculations
+# - GL header row is AUTO-DETECTED (no need to know which row has headers)
 # ============================================================
 
 # -----------------------------
@@ -222,11 +223,78 @@ def read_award(award_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     return df
 
 
-def read_gl(db_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+# -------- GL header auto-detection helpers --------
+def normalize_header_cell(x) -> str:
+    return safe_str(x).replace("\n", " ").strip()
+
+
+def best_effort_match(col: str, required: str) -> bool:
+    c = normalize_header_cell(col).lower()
+    if not c:
+        return False
+
+    r = required.lower()
+    if c == r:
+        return True
+
+    req_keywords = {
+        GL_COL_CATEGORY: ["category"],
+        GL_COL_ACTUALS: ["actual"],
+        GL_COL_PERIOD: ["accounting", "period"],
+        GL_COL_ACTIVITY: ["activity", "code"],
+    }
+    kws = req_keywords.get(required, [r])
+    return all(k in c for k in kws)
+
+
+def detect_header_row_from_required_cols(
+    raw_df: pd.DataFrame,
+    required_cols: list,
+    search_rows: int = 60,
+) -> int:
+    best_row = None
+    best_score = -1
+
+    max_r = min(search_rows, len(raw_df))
+    for r in range(max_r):
+        row_vals = raw_df.iloc[r].tolist()
+        headers = [normalize_header_cell(v) for v in row_vals]
+
+        score = 0
+        for req in required_cols:
+            if any(best_effort_match(h, req) for h in headers):
+                score += 1
+
+        if score > best_score:
+            best_score = score
+            best_row = r
+
+        if best_score == len(required_cols):
+            break
+
+    if best_row is None or best_score <= 0:
+        raise KeyError(
+            f"Could not detect a header row containing required columns: {required_cols}. "
+            f"Tried first {max_r} rows."
+        )
+
+    return best_row
+
+
+def read_gl_with_auto_header(db_bytes: bytes, sheet_name: str, required_cols: list[str], search_rows: int = 60):
+    """
+    Reads GL sheet by:
+      1) loading raw data with header=None
+      2) auto-detecting which row is the header using required column names
+      3) re-reading with header=<detected row>
+    Returns: (df, detected_header_row_index_0based)
+    """
     xl = pd.ExcelFile(BytesIO(db_bytes))
-    df = pd.read_excel(xl, sheet_name=sheet_name)
+    raw = pd.read_excel(xl, sheet_name=sheet_name, header=None)
+    header_row = detect_header_row_from_required_cols(raw, required_cols=required_cols, search_rows=search_rows)
+    df = pd.read_excel(xl, sheet_name=sheet_name, header=header_row)
     df.columns = normalize_columns(df.columns)
-    return df
+    return df, header_row
 
 
 def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_label: str) -> bytes:
@@ -360,7 +428,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Best-effort radio blue (recommended reliable method is Streamlit theme config)
+# Best-effort radio blue (reliable method is Streamlit theme config)
 st.markdown(
     """
     <style>
@@ -398,7 +466,6 @@ db_file = st.file_uploader(
     type=["xlsx"],
 )
 
-# Award doc only relevant in PPM mode
 award_file = None
 if db_type == "PPM":
     award_file = st.file_uploader("Upload Award Info Document (Excel) — optional", type=["xlsx"])
@@ -416,10 +483,32 @@ if db_file:
             xl_gl = pd.ExcelFile(BytesIO(db_bytes))
             gl_sheet = st.selectbox("GL sheet to use", options=xl_gl.sheet_names, index=0)
 
-            df_gl = pd.read_excel(xl_gl, sheet_name=gl_sheet)
-            df_gl.columns = normalize_columns(df_gl.columns)
+            required = [GL_COL_CATEGORY, GL_COL_ACTUALS, GL_COL_PERIOD, GL_COL_ACTIVITY]
 
-            # Find required columns
+            # Auto-detect header row + read
+            df_gl, detected_header_row0 = read_gl_with_auto_header(
+                db_bytes=db_bytes,
+                sheet_name=gl_sheet,
+                required_cols=required,
+                search_rows=80,
+            )
+
+            st.caption(f"Detected header row at Excel row **{detected_header_row0 + 1}**.")
+
+            # Optional override
+            override = st.checkbox("Override detected header row", value=False)
+            if override:
+                override_row_excel = st.number_input(
+                    "Header row (Excel row number)",
+                    min_value=1,
+                    value=int(detected_header_row0 + 1),
+                    step=1,
+                )
+                df_gl = pd.read_excel(pd.ExcelFile(BytesIO(db_bytes)), sheet_name=gl_sheet, header=int(override_row_excel) - 1)
+                df_gl.columns = normalize_columns(df_gl.columns)
+                st.caption(f"Using overridden header row at Excel row **{int(override_row_excel)}**.")
+
+            # Find required columns (exact or keyword-based)
             col_category = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_CATEGORY, keywords=["category"])
             col_actuals = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_ACTUALS, keywords=["actual"])
             col_period = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_PERIOD, keywords=["accounting", "period"])
@@ -477,7 +566,7 @@ if db_file:
             st.stop()
 
         # ============================================================
-        # PPM MODE (unchanged)
+        # PPM MODE (unchanged from previous version)
         # ============================================================
         df_master, report_date = read_aggy_master(db_bytes)
 
@@ -632,7 +721,6 @@ if db_file:
                 )
 
             df_work = df_work.drop(columns=[task_name_col, task_num_col], errors="ignore")
-
             df_work = df_work.rename(columns={"Budget": "Allocated Budget", balance_col: "Current Balance"})
 
             if has_award and df_award is not None:
