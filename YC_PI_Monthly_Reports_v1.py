@@ -880,3 +880,4 @@ if db_file:
             st.code(traceback.format_exc())
 else:
     st.info("Choose PPM or GL, then upload the corresponding database file. (Award Info is only available in PPM mode.)")
+
