@@ -13,7 +13,7 @@ from openpyxl.utils import get_column_letter
 # - Supports selecting database type:
 #     * PPM (Aggie Enterprise / PPM export)  ✅ implemented
 #     * GL  (General Ledger export)         ⏳ placeholder (next step)
-# - Award Info Document is OPTIONAL
+# - Award Info Document is OPTIONAL (PPM only)
 #     * If not provided: no indirect calculations (gross used)
 #     * If provided: merge + net-of-indirect calculations
 # ============================================================
@@ -321,10 +321,29 @@ st.markdown(
       <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
       <div style="opacity: 0.85; margin-top: 0.25rem;">
         Generate PI-level budget reports from either a PPM (Aggie Enterprise) export or a GL export.
-        Award Info is optional and only used to apply indirect rates.
+        Award Info is optional and only used to apply indirect rates (PPM mode only).
         <br/>Report bugs to David Railton Garrett drgarrett@ucdavis.edu
       </div>
     </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# --- Make radio blue (Streamlit uses theme accent color; CSS hack works for many builds) ---
+# Note: Streamlit's official way is to set theme.primaryColor in .streamlit/config.toml.
+# This CSS approach often works, but can vary across Streamlit versions.
+st.markdown(
+    """
+    <style>
+      /* Try to force radio selection + focus to the primary blue */
+      div[role="radiogroup"] input[type="radio"] + div {
+        border-color: #1f77ff !important;
+      }
+      div[role="radiogroup"] input[type="radio"]:checked + div {
+        background: #1f77ff !important;
+        border-color: #1f77ff !important;
+      }
+    </style>
     """,
     unsafe_allow_html=True,
 )
@@ -345,11 +364,16 @@ with st.expander("Debug options", expanded=False):
     show_key_samples = st.checkbox("Show key samples from both files", value=True)
 
 db_file = st.file_uploader(
-    "Upload PPM Database (Aggie Enterprise / PPM export)" if db_type == "PPM" else "Upload GL Database (General Ledger export)",
+    "Upload PPM Database (Aggie Enterprise / PPM export)"
+    if db_type == "PPM"
+    else "Upload GL Database (General Ledger export)",
     type=["xlsx"],
 )
 
-award_file = st.file_uploader("Upload Award Info Document (Excel) — optional", type=["xlsx"])
+# Award doc only relevant in PPM mode
+award_file = None
+if db_type == "PPM":
+    award_file = st.file_uploader("Upload Award Info Document (Excel) — optional", type=["xlsx"])
 
 hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in resulting download", value=True)
 
@@ -361,7 +385,7 @@ if db_file:
         # Branch: PPM vs GL
         # -----------------------------
         if db_type == "PPM":
-            # Read master (and extract report date from master A3)
+            # Read PPM (and extract report date from master A3)
             df_master, report_date = read_aggy_master(db_bytes)
 
             # If we couldn't parse the date, allow a manual fallback
@@ -526,9 +550,23 @@ if db_file:
                 # Rename budgets to gross names first
                 df_work = df_work.rename(columns={"Budget": "Allocated Budget", balance_col: "Current Balance"})
 
+                df_award = None
+                has_award = award_file is not None
+
                 # ---- If award exists: merge indirects + compute net-of-indirect ----
+                if has_award:
+                    award_bytes = award_file.getvalue()
+                    xl_aw = pd.ExcelFile(BytesIO(award_bytes))
+                    award_sheet = st.session_state.get("award_sheet", xl_aw.sheet_names[0])
+                    df_award = read_award(award_bytes, sheet_name=award_sheet)
+
+                    # NOTE: we rely on the UI-selected columns. If user hasn't selected,
+                    # these variables won't exist; so only allow if they were created.
+                    if "master_merge_col" not in locals() or "award_merge_col" not in locals() or "award_rate_col" not in locals():
+                        st.warning("Award file uploaded, but merge settings were not configured. Skipping indirect merge.")
+                        has_award = False
+
                 if has_award and df_award is not None:
-                    # Build merge key from chosen columns
                     df_work["_merge_key"] = df_work_full[master_merge_col].apply(canon_key)
 
                     df_aw = df_award.copy()
@@ -557,7 +595,6 @@ if db_file:
 
                     # Drop gross cols
                     df_merged = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
-
                     df_out = df_merged
 
                 # ---- If no award: do NOT compute indirects; just map gross -> starred cols ----
@@ -568,7 +605,6 @@ if db_file:
                     df_work[ALLOC_BUDGET_NET_COL] = df_work["Allocated Budget"]
                     df_work[CURRENT_BAL_NET_COL] = df_work["Current Balance"]
 
-                    # Keep output shape consistent: drop gross columns
                     df_out = df_work.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
 
                 # Always use detected report date (or manual fallback)
@@ -602,7 +638,6 @@ if db_file:
                 if safe_str(date_label):
                     report_label = f"{safe_str(date_label)} Budget Report"
 
-                # If no award, there is no indirect column to hide; force-hide is harmless but keep tidy:
                 hide_indirect_effective = hide_indirect_in_output if ("Indirect Rate" in df_out.columns) else True
 
                 zip_bytes = build_pi_zip(
@@ -622,7 +657,7 @@ if db_file:
 
         else:
             # GL mode placeholder for next step
-            st.info("GL mode selected. Next step: implement GL parsing + pivot-style report generation.")
+            st.info("GL mode selected. Award Info is not needed and is hidden. Next step: implement GL parsing + pivot-style report generation.")
             st.stop()
 
     except Exception as e:
@@ -630,4 +665,4 @@ if db_file:
         if show_trace:
             st.code(traceback.format_exc())
 else:
-    st.info("Choose PPM or GL, then upload the corresponding database file. The Award Info document is optional.")
+    st.info("Choose PPM or GL, then upload the corresponding database file. (Award Info is only available in PPM mode.)")
