@@ -10,9 +10,12 @@ from openpyxl.utils import get_column_letter
 
 # ============================================================
 # Yellow Cluster: Budget Summary Generator
+# - Supports selecting database type:
+#     * PPM (Aggie Enterprise / PPM export)  ✅ implemented
+#     * GL  (General Ledger export)         ⏳ placeholder (next step)
 # - Award Info Document is OPTIONAL
-#   - If not provided: no indirect calculations (gross values used)
-#   - If provided: merge + net-of-indirect calculations
+#     * If not provided: no indirect calculations (gross used)
+#     * If provided: merge + net-of-indirect calculations
 # ============================================================
 
 # -----------------------------
@@ -210,7 +213,7 @@ def style_sheet(wb, ws_name, currency_cols, footnote_text, hide_indirect=True):
 
 def read_aggy_master(master_bytes: bytes):
     """
-    Reads Aggie Enterprise Database:
+    Reads Aggie Enterprise Database (PPM):
       - Sheet 'Summary'
       - Extracts report run date from A3 BEFORE header trimming
       - Uses row 18 as header (0-based index 17)
@@ -317,291 +320,314 @@ st.markdown(
     <div style="padding: 1rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 1rem;">
       <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
       <div style="opacity: 0.85; margin-top: 0.25rem;">
-        Creates a budget report for all accounts for a given PI using the Aggie Enterprise database.
-        Optionally merges an Award Info document to apply indirect rates.
-        \r Report bugs to David Railton Garrett drgarrett@ucdavis.edu
+        Generate PI-level budget reports from either a PPM (Aggie Enterprise) export or a GL export.
+        Award Info is optional and only used to apply indirect rates.
+        <br/>Report bugs to David Railton Garrett drgarrett@ucdavis.edu
       </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+st.markdown("### Step 1 — Choose database type")
+db_type = st.radio(
+    "Which database are you uploading?",
+    options=["PPM", "GL"],
+    index=0,
+    horizontal=True,
+    help="PPM = Aggie Enterprise (PPM export). GL = General Ledger export.",
+)
+st.markdown("---")
+
 with st.expander("Debug options", expanded=False):
     show_trace = st.checkbox("Show full error trace", value=False)
     show_unmatched = st.checkbox("Show unmatched key samples", value=True)
     show_key_samples = st.checkbox("Show key samples from both files", value=True)
 
-master_file = st.file_uploader("Upload Aggie Enterprise Database (Excel)", type=["xlsx"])
+db_file = st.file_uploader(
+    "Upload PPM Database (Aggie Enterprise / PPM export)" if db_type == "PPM" else "Upload GL Database (General Ledger export)",
+    type=["xlsx"],
+)
+
 award_file = st.file_uploader("Upload Award Info Document (Excel) — optional", type=["xlsx"])
 
 hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in resulting download", value=True)
 
-if master_file:
+if db_file:
     try:
-        master_bytes = master_file.getvalue()
+        db_bytes = db_file.getvalue()
 
-        # Read master (and extract report date from master A3)
-        df_master, report_date = read_aggy_master(master_bytes)
+        # -----------------------------
+        # Branch: PPM vs GL
+        # -----------------------------
+        if db_type == "PPM":
+            # Read master (and extract report date from master A3)
+            df_master, report_date = read_aggy_master(db_bytes)
 
-        # If we couldn't parse the date, allow a manual fallback
-        if report_date:
-            st.info(f"Aggie Enterprise download date: **{report_date}**")
-            date_label = report_date
-        else:
-            st.warning("Could not detect 'Report Run Date', please enter a date manually.")
-            date_label = st.text_input("Report Date (YYYY-MM-DD)", value="")
+            # If we couldn't parse the date, allow a manual fallback
+            if report_date:
+                st.info(f"PPM download date: **{report_date}**")
+                date_label = report_date
+            else:
+                st.warning("Could not detect 'Report Run Date', please enter a date manually.")
+                date_label = st.text_input("Report Date (YYYY-MM-DD)", value="")
 
-        # Option: filter master to ACTIVE by default
-        do_active_only = st.checkbox("Keep only ACTIVE Projects", value=True)
-        status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["project", "status"])
-        df_master_view = df_master[df_master[status_col] == "ACTIVE"].copy() if do_active_only else df_master.copy()
+            # Option: filter master to ACTIVE by default
+            do_active_only = st.checkbox("Keep only ACTIVE Projects", value=True)
+            status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["project", "status"])
+            df_master_view = df_master[df_master[status_col] == "ACTIVE"].copy() if do_active_only else df_master.copy()
 
-        # Award optional: if present, read + show merge config UI
-        df_award = None
-        has_award = award_file is not None
+            # Award optional: if present, read + show merge config UI
+            df_award = None
+            has_award = award_file is not None
 
-        st.markdown("### Preview (before merge)")
-        if has_award:
-            award_bytes = award_file.getvalue()
-            xl_aw = pd.ExcelFile(BytesIO(award_bytes))
-            award_sheet = st.selectbox("Award sheet to use", options=xl_aw.sheet_names, index=0)
-            df_award = read_award(award_bytes, sheet_name=award_sheet)
+            st.markdown("### Preview (before merge)")
+            if has_award:
+                award_bytes = award_file.getvalue()
+                xl_aw = pd.ExcelFile(BytesIO(award_bytes))
+                award_sheet = st.selectbox("Award sheet to use", options=xl_aw.sheet_names, index=0)
+                df_award = read_award(award_bytes, sheet_name=award_sheet)
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Aggie Enterprise preview**")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**PPM preview**")
+                    st.dataframe(df_master_view.head(25), use_container_width=True)
+                with c2:
+                    st.markdown("**Award Info preview**")
+                    st.dataframe(df_award.head(25), use_container_width=True)
+
+                st.markdown("---")
+                st.markdown("### Choose which columns to merge by:")
+
+                default_master_merge = PROJECT_COL_NAME if PROJECT_COL_NAME in df_master_view.columns else df_master_view.columns[0]
+
+                default_aw_merge = None
+                for cand in ["Aggie Enterprise Project #", "AGGIE ENTERPRISE PROJECT #", "AGGIE ENTERPRISE PROJECT # "]:
+                    if cand in df_award.columns:
+                        default_aw_merge = cand
+                        break
+                if default_aw_merge is None:
+                    default_aw_merge = df_award.columns[0]
+
+                master_merge_col = st.selectbox(
+                    "PPM merge column",
+                    options=list(df_master_view.columns),
+                    index=list(df_master_view.columns).index(default_master_merge) if default_master_merge in df_master_view.columns else 0,
+                )
+                award_merge_col = st.selectbox(
+                    "Award Document merge column",
+                    options=list(df_award.columns),
+                    index=list(df_award.columns).index(default_aw_merge) if default_aw_merge in df_award.columns else 0,
+                )
+
+                default_aw_rate = None
+                for cand in ["INDIRECT RATE", "Indirect Rate", "Indirect rate"]:
+                    if cand in df_award.columns:
+                        default_aw_rate = cand
+                        break
+                if default_aw_rate is None:
+                    indirect_candidates = [c for c in df_award.columns if "indirect" in c.lower()]
+                    default_aw_rate = indirect_candidates[0] if indirect_candidates else df_award.columns[-1]
+
+                award_rate_col = st.selectbox(
+                    "Award Document indirect-rate column",
+                    options=list(df_award.columns),
+                    index=list(df_award.columns).index(default_aw_rate) if default_aw_rate in df_award.columns else 0,
+                )
+
+                # Merge preview metrics
+                master_keys = df_master_view[master_merge_col].apply(canon_key)
+                award_keys = df_award[award_merge_col].apply(canon_key)
+
+                master_key_set = set(k for k in master_keys.unique() if k)
+                award_key_set = set(k for k in award_keys.unique() if k)
+                intersect = master_key_set.intersection(award_key_set)
+                match_rate_unique = (len(intersect) / len(master_key_set)) if master_key_set else 0.0
+
+                st.markdown("### Merge preview")
+                st.write(f"**# of PPM Projects:** {len(master_key_set)}")
+                st.write(f"**# of Award Info Sheet Projects:** {len(award_key_set)}")
+                st.write(f"**# that match:** {len(intersect)}")
+                st.write(f"**Approx. match rate (unique PPM keys found in award):** {match_rate_unique:.1%}")
+
+                if show_key_samples:
+                    st.markdown("**Project # Samples:**")
+                    c3, c4 = st.columns(2)
+                    with c3:
+                        st.caption("PPM key sample")
+                        st.code(", ".join(list(master_key_set)[:20]) if master_key_set else "(none)")
+                    with c4:
+                        st.caption("Award key sample")
+                        st.code(", ".join(list(award_key_set)[:20]) if award_key_set else "(none)")
+
+                if show_unmatched:
+                    missing = sorted(list(master_key_set - award_key_set))[:40]
+                    if missing:
+                        st.warning("Some PPM projects were not found in the Award document:")
+                        st.code(", ".join(missing[:40]))
+            else:
                 st.dataframe(df_master_view.head(25), use_container_width=True)
-            with c2:
-                st.markdown("**Award Info preview**")
-                st.dataframe(df_award.head(25), use_container_width=True)
+                st.info("No Award Info document uploaded — reports will be generated WITHOUT indirect calculations.")
 
             st.markdown("---")
-            st.markdown("### Choose which columns to merge by:")
+            st.markdown("### Generate Monthly Reports")
 
-            default_master_merge = PROJECT_COL_NAME if PROJECT_COL_NAME in df_master_view.columns else df_master_view.columns[0]
+            if st.button("Generate ZIP (one Excel per PI)", type="primary"):
+                df_work_full = df_master_view.copy()
 
-            default_aw_merge = None
-            for cand in ["Aggie Enterprise Project #", "AGGIE ENTERPRISE PROJECT #", "AGGIE ENTERPRISE PROJECT # "]:
-                if cand in df_award.columns:
-                    default_aw_merge = cand
-                    break
-            if default_aw_merge is None:
-                default_aw_merge = df_award.columns[0]
+                project_col = find_column_by_exact_or_keywords(
+                    df_work_full.columns, PROJECT_COL_NAME, keywords=["project", "number"]
+                )
+                task_name_col = find_column_by_exact_or_keywords(
+                    df_work_full.columns, TASK_NAME_COL_NAME, keywords=["task", "name"]
+                )
+                task_num_col = find_column_by_exact_or_keywords(
+                    df_work_full.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"]
+                )
 
-            master_merge_col = st.selectbox(
-                "Aggie Enterprise merge column",
-                options=list(df_master_view.columns),
-                index=list(df_master_view.columns).index(default_master_merge) if default_master_merge in df_master_view.columns else 0,
-            )
-            award_merge_col = st.selectbox(
-                "Award Document merge column",
-                options=list(df_award.columns),
-                index=list(df_award.columns).index(default_aw_merge) if default_aw_merge in df_award.columns else 0,
-            )
+                balance_candidates = [c for c in df_work_full.columns if str(c).startswith("Budget Balance")]
+                if not balance_candidates:
+                    raise KeyError("PPM document is missing a column starting with 'Budget Balance'.")
+                balance_col = balance_candidates[0]
 
-            default_aw_rate = None
-            for cand in ["INDIRECT RATE", "Indirect Rate", "Indirect rate"]:
-                if cand in df_award.columns:
-                    default_aw_rate = cand
-                    break
-            if default_aw_rate is None:
-                indirect_candidates = [c for c in df_award.columns if "indirect" in c.lower()]
-                default_aw_rate = indirect_candidates[0] if indirect_candidates else df_award.columns[-1]
+                keep_cols = []
+                for c in [
+                    PI_COL_NAME,
+                    project_col,
+                    "Project Name",
+                    "Project Manager",
+                    task_name_col,
+                    task_num_col,
+                    "Budget",
+                    "expenses",
+                    balance_col,
+                ]:
+                    if c in df_work_full.columns and c not in keep_cols:
+                        keep_cols.append(c)
 
-            award_rate_col = st.selectbox(
-                "Award Document indirect-rate column",
-                options=list(df_award.columns),
-                index=list(df_award.columns).index(default_aw_rate) if default_aw_rate in df_award.columns else 0,
-            )
+                df_work = df_work_full[keep_cols].copy()
 
-            # Merge preview metrics
-            master_keys = df_master_view[master_merge_col].apply(canon_key)
-            award_keys = df_award[award_merge_col].apply(canon_key)
+                # Combine Project Number + Task Number in Project Number column
+                p = df_work[project_col].apply(safe_str).str.replace(".0", "", regex=False)
+                t = df_work[task_num_col].apply(safe_str).str.replace(".0", "", regex=False)
+                df_work[project_col] = (p + "-" + t).str.strip("-")
 
-            master_key_set = set(k for k in master_keys.unique() if k)
-            award_key_set = set(k for k in award_keys.unique() if k)
-            intersect = master_key_set.intersection(award_key_set)
-            match_rate_unique = (len(intersect) / len(master_key_set)) if master_key_set else 0.0
+                # Combine Project Name + Task Name into Project Name
+                if "Project Name" in df_work.columns:
+                    df_work["Project Name"] = (
+                        df_work["Project Name"].apply(safe_str)
+                        + " – "
+                        + df_work[task_name_col].apply(safe_str)
+                    )
 
-            st.markdown("### Merge preview")
-            st.write(f"**# of Aggie Enterprise Projects:** {len(master_key_set)}")
-            st.write(f"**# of Award Info Sheet Projects:** {len(award_key_set)}")
-            st.write(f"**# that match:** {len(intersect)}")
-            st.write(f"**Approx. match rate (unique master keys found in award):** {match_rate_unique:.1%}")
+                # Drop Task columns
+                df_work = df_work.drop(columns=[task_name_col, task_num_col], errors="ignore")
 
-            if show_key_samples:
-                st.markdown("**Project # Samples:**")
-                c3, c4 = st.columns(2)
-                with c3:
-                    st.caption("Master key sample")
-                    st.code(", ".join(list(master_key_set)[:20]) if master_key_set else "(none)")
-                with c4:
-                    st.caption("Award key sample")
-                    st.code(", ".join(list(award_key_set)[:20]) if award_key_set else "(none)")
+                # Rename budgets to gross names first
+                df_work = df_work.rename(columns={"Budget": "Allocated Budget", balance_col: "Current Balance"})
 
-            if show_unmatched:
-                missing = sorted(list(master_key_set - award_key_set))[:40]
-                if missing:
-                    st.warning("Some Aggie Enterprise projects were not found in the Award document:")
-                    st.code(", ".join(missing[:40]))
+                # ---- If award exists: merge indirects + compute net-of-indirect ----
+                if has_award and df_award is not None:
+                    # Build merge key from chosen columns
+                    df_work["_merge_key"] = df_work_full[master_merge_col].apply(canon_key)
+
+                    df_aw = df_award.copy()
+                    df_aw["_merge_key"] = df_aw[award_merge_col].apply(canon_key)
+
+                    df_aw_sub = df_aw[["_merge_key", award_rate_col]].copy()
+                    df_aw_sub = df_aw_sub.drop_duplicates(subset=["_merge_key"], keep="first")
+                    df_aw_sub = df_aw_sub.rename(columns={award_rate_col: "Indirect Rate"})
+
+                    df_merged = df_work.merge(df_aw_sub, on="_merge_key", how="left").drop(columns=["_merge_key"])
+
+                    matched_rows = df_merged["Indirect Rate"].notna().sum()
+                    total_rows = len(df_merged)
+                    st.info(
+                        f"Row-level merge match: {matched_rows}/{total_rows} "
+                        f"({(matched_rows/total_rows if total_rows else 0):.1%})"
+                    )
+
+                    df_merged["Indirect Rate"] = pd.to_numeric(df_merged["Indirect Rate"], errors="coerce").fillna(0.0)
+                    df_merged["Allocated Budget"] = pd.to_numeric(df_merged["Allocated Budget"], errors="coerce")
+                    df_merged["Current Balance"] = pd.to_numeric(df_merged["Current Balance"], errors="coerce")
+
+                    denom = 1.0 + df_merged["Indirect Rate"]
+                    df_merged[ALLOC_BUDGET_NET_COL] = df_merged["Allocated Budget"] / denom
+                    df_merged[CURRENT_BAL_NET_COL] = df_merged["Current Balance"] / denom
+
+                    # Drop gross cols
+                    df_merged = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
+
+                    df_out = df_merged
+
+                # ---- If no award: do NOT compute indirects; just map gross -> starred cols ----
+                else:
+                    df_work["Allocated Budget"] = pd.to_numeric(df_work["Allocated Budget"], errors="coerce")
+                    df_work["Current Balance"] = pd.to_numeric(df_work["Current Balance"], errors="coerce")
+
+                    df_work[ALLOC_BUDGET_NET_COL] = df_work["Allocated Budget"]
+                    df_work[CURRENT_BAL_NET_COL] = df_work["Current Balance"]
+
+                    # Keep output shape consistent: drop gross columns
+                    df_out = df_work.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
+
+                # Always use detected report date (or manual fallback)
+                if safe_str(date_label):
+                    df_out["Date Pulled"] = safe_str(date_label)
+
+                # Normalize PI to Last, First
+                if PI_COL_NAME not in df_out.columns:
+                    raise KeyError(
+                        f"PI column '{PI_COL_NAME}' not found in PPM. Columns: {list(df_out.columns)}"
+                    )
+                df_out[PI_COL_NAME] = df_out[PI_COL_NAME].apply(normalize_pi_last_first)
+
+                # Reorder (best effort)
+                desired = [
+                    PI_COL_NAME,
+                    "Project Manager",
+                    "Date Pulled",
+                    project_col,
+                    "Project Name",
+                    ALLOC_BUDGET_NET_COL,
+                    CURRENT_BAL_NET_COL,
+                    "Indirect Rate",
+                    "expenses",
+                ]
+                desired = [c for c in desired if c in df_out.columns]
+                remaining = [c for c in df_out.columns if c not in desired]
+                df_out = df_out[desired + remaining]
+
+                report_label = "Budget Report"
+                if safe_str(date_label):
+                    report_label = f"{safe_str(date_label)} Budget Report"
+
+                # If no award, there is no indirect column to hide; force-hide is harmless but keep tidy:
+                hide_indirect_effective = hide_indirect_in_output if ("Indirect Rate" in df_out.columns) else True
+
+                zip_bytes = build_pi_zip(
+                    df_out=df_out,
+                    pi_col=PI_COL_NAME,
+                    hide_indirect=hide_indirect_effective,
+                    report_label=report_label,
+                )
+
+                st.success("ZIP generated!")
+                st.download_button(
+                    "Download ZIP (PI files)",
+                    data=zip_bytes,
+                    file_name=f"{make_safe_filename_fragment(report_label)} - PI Files.zip",
+                    mime="application/zip",
+                )
+
         else:
-            st.dataframe(df_master_view.head(25), use_container_width=True)
-            st.info("No Award Info document uploaded — reports will be generated WITHOUT indirect calculations.")
-
-        st.markdown("---")
-        st.markdown("### Generate Monthly Reports")
-
-        if st.button("Generate ZIP (one Excel per PI)", type="primary"):
-            df_work_full = df_master_view.copy()
-
-            project_col = find_column_by_exact_or_keywords(
-                df_work_full.columns, PROJECT_COL_NAME, keywords=["project", "number"]
-            )
-            task_name_col = find_column_by_exact_or_keywords(
-                df_work_full.columns, TASK_NAME_COL_NAME, keywords=["task", "name"]
-            )
-            task_num_col = find_column_by_exact_or_keywords(
-                df_work_full.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"]
-            )
-
-            balance_candidates = [c for c in df_work_full.columns if str(c).startswith("Budget Balance")]
-            if not balance_candidates:
-                raise KeyError("Aggie Enterprise document is missing a column starting with 'Budget Balance'.")
-            balance_col = balance_candidates[0]
-
-            keep_cols = []
-            for c in [
-                PI_COL_NAME,
-                project_col,
-                "Project Name",
-                "Project Manager",
-                task_name_col,
-                task_num_col,
-                "Budget",
-                "expenses",
-                balance_col,
-            ]:
-                if c in df_work_full.columns and c not in keep_cols:
-                    keep_cols.append(c)
-
-            df_work = df_work_full[keep_cols].copy()
-
-            # Combine Project Number + Task Number in Project Number column
-            p = df_work[project_col].apply(safe_str).str.replace(".0", "", regex=False)
-            t = df_work[task_num_col].apply(safe_str).str.replace(".0", "", regex=False)
-            df_work[project_col] = (p + "-" + t).str.strip("-")
-
-            # Combine Project Name + Task Name into Project Name
-            if "Project Name" in df_work.columns:
-                df_work["Project Name"] = (
-                    df_work["Project Name"].apply(safe_str)
-                    + " – "
-                    + df_work[task_name_col].apply(safe_str)
-                )
-
-            # Drop Task columns
-            df_work = df_work.drop(columns=[task_name_col, task_num_col], errors="ignore")
-
-            # Rename budgets to gross names first
-            df_work = df_work.rename(columns={"Budget": "Allocated Budget", balance_col: "Current Balance"})
-
-            # ---- If award exists: merge indirects + compute net-of-indirect ----
-            if has_award and df_award is not None:
-                # Build merge key from chosen columns
-                df_work["_merge_key"] = df_work_full[master_merge_col].apply(canon_key)
-
-                df_aw = df_award.copy()
-                df_aw["_merge_key"] = df_aw[award_merge_col].apply(canon_key)
-
-                df_aw_sub = df_aw[["_merge_key", award_rate_col]].copy()
-                df_aw_sub = df_aw_sub.drop_duplicates(subset=["_merge_key"], keep="first")
-                df_aw_sub = df_aw_sub.rename(columns={award_rate_col: "Indirect Rate"})
-
-                df_merged = df_work.merge(df_aw_sub, on="_merge_key", how="left").drop(columns=["_merge_key"])
-
-                matched_rows = df_merged["Indirect Rate"].notna().sum()
-                total_rows = len(df_merged)
-                st.info(
-                    f"Row-level merge match: {matched_rows}/{total_rows} "
-                    f"({(matched_rows/total_rows if total_rows else 0):.1%})"
-                )
-
-                df_merged["Indirect Rate"] = pd.to_numeric(df_merged["Indirect Rate"], errors="coerce").fillna(0.0)
-                df_merged["Allocated Budget"] = pd.to_numeric(df_merged["Allocated Budget"], errors="coerce")
-                df_merged["Current Balance"] = pd.to_numeric(df_merged["Current Balance"], errors="coerce")
-
-                denom = 1.0 + df_merged["Indirect Rate"]
-                df_merged[ALLOC_BUDGET_NET_COL] = df_merged["Allocated Budget"] / denom
-                df_merged[CURRENT_BAL_NET_COL] = df_merged["Current Balance"] / denom
-
-                # Drop gross cols
-                df_merged = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
-
-                df_out = df_merged
-
-            # ---- If no award: do NOT compute indirects; just map gross -> starred cols ----
-            else:
-                df_work["Allocated Budget"] = pd.to_numeric(df_work["Allocated Budget"], errors="coerce")
-                df_work["Current Balance"] = pd.to_numeric(df_work["Current Balance"], errors="coerce")
-
-                df_work[ALLOC_BUDGET_NET_COL] = df_work["Allocated Budget"]
-                df_work[CURRENT_BAL_NET_COL] = df_work["Current Balance"]
-
-                # Keep output shape consistent: drop gross columns
-                df_out = df_work.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
-
-            # Always use detected report date (or manual fallback)
-            if safe_str(date_label):
-                df_out["Date Pulled"] = safe_str(date_label)
-
-            # Normalize PI to Last, First
-            if PI_COL_NAME not in df_out.columns:
-                raise KeyError(
-                    f"PI column '{PI_COL_NAME}' not found in master. Columns: {list(df_out.columns)}"
-                )
-            df_out[PI_COL_NAME] = df_out[PI_COL_NAME].apply(normalize_pi_last_first)
-
-            # Reorder (best effort)
-            desired = [
-                PI_COL_NAME,
-                "Project Manager",
-                "Date Pulled",
-                project_col,
-                "Project Name",
-                ALLOC_BUDGET_NET_COL,
-                CURRENT_BAL_NET_COL,
-                "Indirect Rate",
-                "expenses",
-            ]
-            desired = [c for c in desired if c in df_out.columns]
-            remaining = [c for c in df_out.columns if c not in desired]
-            df_out = df_out[desired + remaining]
-
-            report_label = "Budget Report"
-            if safe_str(date_label):
-                report_label = f"{safe_str(date_label)} Budget Report"
-
-            # If no award, there is no indirect column to hide; force-hide is harmless but keep tidy:
-            hide_indirect_effective = hide_indirect_in_output if ("Indirect Rate" in df_out.columns) else True
-
-            zip_bytes = build_pi_zip(
-                df_out=df_out,
-                pi_col=PI_COL_NAME,
-                hide_indirect=hide_indirect_effective,
-                report_label=report_label,
-            )
-
-            st.success("ZIP generated!")
-            st.download_button(
-                "Download ZIP (PI files)",
-                data=zip_bytes,
-                file_name=f"{make_safe_filename_fragment(report_label)} - PI Files.zip",
-                mime="application/zip",
-            )
+            # GL mode placeholder for next step
+            st.info("GL mode selected. Next step: implement GL parsing + pivot-style report generation.")
+            st.stop()
 
     except Exception as e:
         st.error(f"Error: {e}")
         if show_trace:
             st.code(traceback.format_exc())
 else:
-    st.info("Upload the Aggie Enterprise file to begin. The Award Info document is optional.")
+    st.info("Choose PPM or GL, then upload the corresponding database file. The Award Info document is optional.")
