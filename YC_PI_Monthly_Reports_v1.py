@@ -525,6 +525,16 @@ if db_file:
                 }
             )
 
+            # --------------------------------------------------
+            # Ignore N/A categories
+            # --------------------------------------------------
+            df_subset[GL_COL_CATEGORY] = df_subset[GL_COL_CATEGORY].apply(safe_str)
+
+            df_subset = df_subset[
+             df_subset[GL_COL_CATEGORY].str.upper().ne("N/A")
+                & df_subset[GL_COL_CATEGORY].ne("")
+            ]
+
             st.markdown("### GL Preview (subset)")
             st.dataframe(df_subset.head(50), use_container_width=True)
 
