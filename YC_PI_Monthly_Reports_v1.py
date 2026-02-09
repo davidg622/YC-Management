@@ -52,7 +52,7 @@ CURRENT_BAL_NET_COL = "Current Balance*"
 GL_COL_CATEGORY = "Category"
 GL_COL_ACTUALS = "Actuals"
 GL_COL_PERIOD = "Accounting Period"
-GL_COL_ACTIVITY = "Activity Code"
+GL_COL_ACTIVITY = "Activity"
 
 # -----------------------------
 # Helpers
