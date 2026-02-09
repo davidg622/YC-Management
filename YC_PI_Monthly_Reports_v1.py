@@ -508,7 +508,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown("# Choose database type")
+st.markdown("#### Choose database type")
 db_type = st.radio(
     "Which database are you uploading?",
     options=["PPM", "GL"],
