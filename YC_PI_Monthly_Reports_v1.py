@@ -1,4 +1,4 @@
-import re
+iimport re
 import traceback
 from io import BytesIO
 import zipfile
@@ -12,20 +12,27 @@ from openpyxl.formatting.rule import CellIsRule
 # ============================================================
 # Yellow Cluster: Budget Summary Generator
 # - Supports selecting database type:
-#     * PPM (Aggie Enterprise / PPM export)  ✅ implemented
-#     * GL  (General Ledger export)         ✅ implemented (subset + pivot)
+#     * PPM (Aggie Enterprise / PPM export)
+#     * GL  (General Ledger export)
 # - Award Info Document is OPTIONAL (PPM only)
-#     * If not provided: no indirect calculations (gross used)
-#     * If provided: merge + net-of-indirect calculations
-# - GL header row is AUTO-DETECTED
-# - GL ignores Category == "N/A"
-# - GL output:
-#     * Sheet GL_Subset: every transaction + selected cols + Financial Department
-#     * Sheet Pivot_By_Category:
-#         Category | Budget (blank) | Actuals | Balance (=Budget-Actuals)
-#         Totals row at bottom
-#         Balance conditional colors (green positive, red negative)
-#         Title: "<Financial Department> Expenses"
+# - GL:
+#     * User chooses sheet
+#     * Header row auto-detected WITHOUT needing exact header row
+#     * Column names auto-detected (keywords)
+#     * Ignores Category == "N/A" (and blanks)
+#     * Pulls Description + Financial Department
+#     * Adds Notes (blank) columns for manual entry
+#     * Output workbook:
+#         - GL_Subset: transactions (selected cols + Financial Department + Description + Notes)
+#         - GL_Pulled_Columns_Check: ONLY pulled cols (no Notes) for verification
+#         - Pivot_By_Category:
+#           Category | Budget(blank) | Actuals | Balance (=Budget-Actuals) | Notes(blank)
+#           + totals row with SUM formulas (always sums rows above)
+#           + Balance conditional colors (green positive / red negative)
+#           + Title: "<Financial Department> Expenses"
+#         - Larger fonts + alternating light-green rows for readability
+# - UI:
+#     * If GL selected, Award uploader + indirect toggle hidden
 # ============================================================
 
 # -----------------------------
@@ -42,12 +49,10 @@ st.set_page_config(
 # -----------------------------
 SUMMARY_SHEET_NAME = "Summary"
 HEADER_ROW_INDEX = 17  # 0-based index: Excel row 18 (i.e., delete first 17 rows)
-
-# Where the report run date lives BEFORE trimming:
 REPORT_RUNDATE_ROW0 = 2
 REPORT_RUNDATE_COL0 = 0
 
-# PPM column identifiers we use for the final output
+# PPM column identifiers
 PI_COL_NAME = "Project Principal Investigator"
 PROJECT_COL_NAME = "Project Number"
 TASK_NAME_COL_NAME = "Task Name"
@@ -57,12 +62,13 @@ STATUS_COL_NAME = "Project Status"
 ALLOC_BUDGET_NET_COL = "Allocated Budget*"
 CURRENT_BAL_NET_COL = "Current Balance*"
 
-# GL required columns
+# GL canonical columns
 GL_COL_CATEGORY = "Category"
 GL_COL_ACTUALS = "Actuals"
 GL_COL_PERIOD = "Accounting Period"
-GL_COL_ACTIVITY = "Activity"
+GL_COL_ACTIVITY = "Activity Code"
 GL_COL_FIN_DEPT = "Financial Department"
+GL_COL_DESC = "Description"
 
 # -----------------------------
 # Helpers
@@ -135,79 +141,61 @@ def make_safe_filename_fragment(name: str) -> str:
     return frag[:120] if frag else "Report"
 
 
-def apply_currency_format(wb, ws_name, columns):
-    ws = wb[ws_name]
-    header_row = next(ws.iter_rows(min_row=1, max_row=1))
-    pos = {}
-    for cell in header_row:
-        if cell.value in columns:
-            pos[cell.value] = cell.column_letter
-
-    for _, col_letter in pos.items():
-        for cell in ws[col_letter]:
-            if cell.row == 1:
-                continue
-            cell.number_format = numbers.FORMAT_CURRENCY_USD_SIMPLE
-
-
-def style_sheet(wb, ws_name, currency_cols, footnote_text, hide_indirect=True):
-    ws = wb[ws_name]
-
-    apply_currency_format(wb, ws_name, currency_cols)
-
-    header_font = Font(bold=True, size=12)
-    body_font = Font(size=11)
-
-    header_row = next(ws.iter_rows(min_row=1, max_row=1))
-    indirect_col_letter = None
-    balance_col_letter = None
-
-    for cell in header_row:
-        cell.font = header_font
-        if cell.value == CURRENT_BAL_NET_COL:
-            balance_col_letter = cell.column_letter
-            cell.fill = PatternFill(start_color="FFFAD7", end_color="FFFAD7", fill_type="solid")
-        if cell.value == "Indirect Rate":
-            indirect_col_letter = cell.column_letter
-
-    fill_green = PatternFill(start_color="FFE6F4EA", end_color="FFE6F4EA", fill_type="solid")
-    for r in range(2, ws.max_row + 1):
-        for cell in ws[r]:
-            cell.font = body_font
-            if r % 2 == 0:
-                cell.fill = fill_green
-
-    if balance_col_letter:
-        for cell in ws[balance_col_letter]:
-            if cell.row == 1:
-                continue
-            color = None
-            try:
-                v = float(cell.value)
-                if v < 0:
-                    color = "8B0000"
-                elif v > 0:
-                    color = "004B00"
-            except Exception:
-                pass
-            cell.font = Font(bold=True, size=11, color=color) if color else Font(bold=True, size=11)
-
+# -----------------------------
+# Formatting helpers
+# -----------------------------
+def _auto_width(ws, max_width=55, min_width=10):
     for col in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
         for cell in col:
             if cell.value is not None:
                 max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[col_letter].width = max(10, min(max_len + 2, 55))
-
-    if hide_indirect and indirect_col_letter:
-        ws.column_dimensions[indirect_col_letter].hidden = True
-
-    footer_row = ws.max_row + 2
-    ws[f"A{footer_row}"] = footnote_text
-    ws[f"A{footer_row}"].font = Font(italic=True, size=10)
+        ws.column_dimensions[col_letter].width = max(min_width, min(max_len + 2, max_width))
 
 
+def _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=None, font_size=12):
+    """
+    - Bold header
+    - Larger fonts
+    - Alternating light-green row shading
+    - Currency formatting for specified header names
+    """
+    currency_headers = currency_headers or []
+
+    header_font = Font(bold=True, size=font_size + 1)
+    body_font = Font(size=font_size)
+
+    # Header styling
+    for cell in next(ws.iter_rows(min_row=header_row, max_row=header_row)):
+        cell.font = header_font
+
+    # Map headers to column letters
+    headers = [c.value for c in next(ws.iter_rows(min_row=header_row, max_row=header_row))]
+    header_to_col = {h: get_column_letter(i + 1) for i, h in enumerate(headers)}
+
+    # Alternating fill
+    fill_green = PatternFill(start_color="FFE6F4EA", end_color="FFE6F4EA", fill_type="solid")
+
+    for r in range(start_data_row, ws.max_row + 1):
+        for cell in ws[r]:
+            cell.font = body_font
+            if (r - start_data_row) % 2 == 1:
+                cell.fill = fill_green
+
+    # Currency formatting
+    for h in currency_headers:
+        if h in header_to_col:
+            col_letter = header_to_col[h]
+            for cell in ws[col_letter]:
+                if cell.row <= header_row:
+                    continue
+                cell.number_format = numbers.FORMAT_CURRENCY_USD_SIMPLE
+
+
+# -----------------------------
+# PPM readers
+# -----------------------------
 def read_aggy_master(master_bytes: bytes):
     df_raw = pd.read_excel(BytesIO(master_bytes), sheet_name=SUMMARY_SHEET_NAME, header=None)
 
@@ -233,7 +221,9 @@ def read_award(award_bytes: bytes, sheet_name: str) -> pd.DataFrame:
     return df
 
 
-# -------- GL header auto-detection helpers --------
+# -----------------------------
+# GL: header auto-detection
+# -----------------------------
 def normalize_header_cell(x) -> str:
     return safe_str(x).replace("\n", " ").strip()
 
@@ -242,9 +232,7 @@ def best_effort_match(col: str, required: str) -> bool:
     c = normalize_header_cell(col).lower()
     if not c:
         return False
-
-    r = required.lower()
-    if c == r:
+    if c == required.lower():
         return True
 
     req_keywords = {
@@ -253,16 +241,13 @@ def best_effort_match(col: str, required: str) -> bool:
         GL_COL_PERIOD: ["accounting", "period"],
         GL_COL_ACTIVITY: ["activity", "code"],
         GL_COL_FIN_DEPT: ["financial", "department"],
+        GL_COL_DESC: ["description"],
     }
-    kws = req_keywords.get(required, [r])
+    kws = req_keywords.get(required, [required.lower()])
     return all(k in c for k in kws)
 
 
-def detect_header_row_from_required_cols(
-    raw_df: pd.DataFrame,
-    required_cols: list,
-    search_rows: int = 60,
-) -> int:
+def detect_header_row_from_required_cols(raw_df: pd.DataFrame, required_cols: list, search_rows: int = 80) -> int:
     best_row = None
     best_score = -1
 
@@ -282,16 +267,18 @@ def detect_header_row_from_required_cols(
         if best_score == len(required_cols):
             break
 
-    if best_row is None or best_score <= 0:
+    # Require at least len(required_cols)-1 matches (robust but not too strict)
+    min_needed = max(1, len(required_cols) - 1)
+    if best_row is None or best_score < min_needed:
         raise KeyError(
-            f"Could not detect a header row containing required columns: {required_cols}. "
-            f"Tried first {max_r} rows."
+            f"Could not detect a header row with at least {min_needed} of {len(required_cols)} "
+            f"required columns: {required_cols}. Tried first {max_r} rows."
         )
 
     return best_row
 
 
-def read_gl_with_auto_header(db_bytes: bytes, sheet_name: str, required_cols: list[str], search_rows: int = 60):
+def read_gl_with_auto_header(db_bytes: bytes, sheet_name: str, required_cols: list[str], search_rows: int = 80):
     xl = pd.ExcelFile(BytesIO(db_bytes))
     raw = pd.read_excel(xl, sheet_name=sheet_name, header=None)
     header_row = detect_header_row_from_required_cols(raw, required_cols=required_cols, search_rows=search_rows)
@@ -300,6 +287,9 @@ def read_gl_with_auto_header(db_bytes: bytes, sheet_name: str, required_cols: li
     return df, header_row
 
 
+# -----------------------------
+# PPM output builder (ZIP per PI)
+# -----------------------------
 def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_label: str) -> bytes:
     df_out = df_out.copy()
     df_out[pi_col] = df_out[pi_col].apply(normalize_pi_last_first)
@@ -339,7 +329,25 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
             with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
                 group.to_excel(writer, index=False, sheet_name="Budget Summary")
                 wb = writer.book
-                style_sheet(wb, "Budget Summary", currency_cols, footnote, hide_indirect=hide_indirect)
+
+                # Style
+                ws = wb["Budget Summary"]
+                # Use existing style logic but bump font sizes and add alternating shading
+                _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=12)
+
+                # Optional hide indirect column
+                if hide_indirect and "Indirect Rate" in group.columns:
+                    headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+                    if "Indirect Rate" in headers:
+                        idx = headers.index("Indirect Rate") + 1
+                        ws.column_dimensions[get_column_letter(idx)].hidden = True
+
+                _auto_width(ws)
+
+                footer_row = ws.max_row + 2
+                ws[f"A{footer_row}"] = footnote
+                ws[f"A{footer_row}"].font = Font(italic=True, size=11)
+
             xbuf.seek(0)
 
             safe_pi = make_safe_filename_fragment(pi)
@@ -361,101 +369,76 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
     return zip_buf.getvalue()
 
 
-def _auto_width(ws, max_width=55, min_width=10):
-    for col in ws.columns:
-        max_len = 0
-        col_letter = get_column_letter(col[0].column)
-        for cell in col:
-            if cell.value is not None:
-                max_len = max(max_len, len(str(cell.value)))
-        ws.column_dimensions[col_letter].width = max(min_width, min(max_len + 2, max_width))
-
-
+# -----------------------------
+# GL output builder (3-sheet workbook)
+# -----------------------------
 def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFrame, dept_name: str) -> bytes:
-    """
-    Output workbook:
-      - GL_Subset: all transactions with selected cols incl Financial Department
-      - Pivot_By_Category: Category | Budget(blank) | Actuals | Balance (=Budget-Actuals)
-        - totals at bottom
-        - balance colored via conditional formatting
-        - title: "<dept_name> Expenses"
-    """
-    title = f"{safe_str(dept_name) or 'Financial Department'} Expenses"
+    dept_name_clean = safe_str(dept_name) or "Financial Department"
+    title = f"{dept_name_clean} Expenses"
 
-    # Prepare a pivot table skeleton (Budget blank, Balance formula written in Excel)
-    df_pivot = pivot_categories_actuals.copy()
-    df_pivot = df_pivot.rename(columns={GL_COL_ACTUALS: "Actuals"})
-    df_pivot.insert(1, "Budget", "")     # blank for user
-    df_pivot["Balance"] = ""            # formulas added later in Excel
+    # Sheet: only pulled columns (verification)
+    check_cols = [GL_COL_CATEGORY, GL_COL_ACTUALS, GL_COL_PERIOD, GL_COL_ACTIVITY, GL_COL_FIN_DEPT, GL_COL_DESC]
+    df_check = df_subset[[c for c in check_cols if c in df_subset.columns]].copy()
 
-    # Append totals row (Budget blank; Balance formula; Actuals total computed)
-    total_actuals = float(pd.to_numeric(df_pivot["Actuals"], errors="coerce").fillna(0).sum()) if len(df_pivot) else 0.0
-    df_pivot = pd.concat(
-        [df_pivot, pd.DataFrame([{"Category": "TOTAL", "Budget": "", "Actuals": total_actuals, "Balance": ""}])],
-        ignore_index=True,
-    )
+    # Pivot base (Category + Actuals)
+    piv = pivot_categories_actuals.copy()
+    piv = piv.rename(columns={GL_COL_ACTUALS: "Actuals"})
+    piv = piv.sort_values(by="Actuals", ascending=False, na_position="last")
+
+    # Add blank/manual columns
+    piv.insert(1, "Budget", "")
+    piv["Balance"] = ""   # formula in Excel
+    piv["Notes"] = ""     # manual
 
     xbuf = BytesIO()
     with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
         df_subset.to_excel(writer, index=False, sheet_name="GL_Subset")
-        df_pivot.to_excel(writer, index=False, sheet_name="Pivot_By_Category")
+        df_check.to_excel(writer, index=False, sheet_name="GL_Pulled_Columns_Check")
+        piv.to_excel(writer, index=False, sheet_name="Pivot_By_Category")
 
         wb = writer.book
 
-        # ---- GL_Subset formatting ----
+        # ---- GL_Subset styling ----
         ws_sub = wb["GL_Subset"]
-        for cell in next(ws_sub.iter_rows(min_row=1, max_row=1)):
-            cell.font = Font(bold=True, size=12)
+        _style_table_sheet(ws_sub, header_row=1, start_data_row=2, currency_headers=[GL_COL_ACTUALS], font_size=12)
         _auto_width(ws_sub)
-        # Currency for Actuals in subset
-        if GL_COL_ACTUALS in [c.value for c in next(ws_sub.iter_rows(min_row=1, max_row=1))]:
-            apply_currency_format(wb, "GL_Subset", [GL_COL_ACTUALS])
 
-        # ---- Pivot formatting ----
+        # ---- Check sheet styling ----
+        ws_chk = wb["GL_Pulled_Columns_Check"]
+        _style_table_sheet(ws_chk, header_row=1, start_data_row=2, currency_headers=[GL_COL_ACTUALS], font_size=12)
+        _auto_width(ws_chk)
+
+        # ---- Pivot styling + formulas ----
         ws_piv = wb["Pivot_By_Category"]
 
-        # Insert title row at top
+        # Insert title row
         ws_piv.insert_rows(1)
         ws_piv["A1"] = title
-        ws_piv["A1"].font = Font(bold=True, size=13)
+        ws_piv["A1"].font = Font(bold=True, size=14)
 
-        # Bold header row (now row 2)
-        for cell in next(ws_piv.iter_rows(min_row=2, max_row=2)):
-            cell.font = Font(bold=True, size=12)
+        # Style pivot (header row now 2, data starts 3)
+        _style_table_sheet(ws_piv, header_row=2, start_data_row=3, currency_headers=["Budget", "Actuals", "Balance"], font_size=12)
 
-        # Currency format for Budget/Actuals/Balance (data rows start at row 3)
-        # NOTE: apply_currency_format expects header row at row 1, but our header is now row 2.
-        # We'll manually set formats.
-        header_row_idx = 2
-        headers = [c.value for c in next(ws_piv.iter_rows(min_row=header_row_idx, max_row=header_row_idx))]
-        col_map = {name: idx + 1 for idx, name in enumerate(headers)}  # 1-based column index
+        headers = [c.value for c in next(ws_piv.iter_rows(min_row=2, max_row=2))]
+        col_map = {name: idx + 1 for idx, name in enumerate(headers)}  # 1-based index
 
-        def set_currency(col_name: str):
-            if col_name not in col_map:
-                return
-            col_idx = col_map[col_name]
-            for r in range(3, ws_piv.max_row + 1):
-                ws_piv.cell(row=r, column=col_idx).number_format = numbers.FORMAT_CURRENCY_USD_SIMPLE
+        data_start = 3
+        data_end = ws_piv.max_row  # current last row (categories)
 
-        set_currency("Budget")
-        set_currency("Actuals")
-        set_currency("Balance")
+        # Add Balance formulas for all category rows (Balance = Budget - Actuals)
+        b_col = col_map.get("Budget")
+        a_col = col_map.get("Actuals")
+        bal_col = col_map.get("Balance")
 
-        # Add Balance formulas (Balance = Budget - Actuals)
-        # Columns: Category(A), Budget(B), Actuals(C), Balance(D)
-        if all(x in col_map for x in ["Budget", "Actuals", "Balance"]):
-            b_col = col_map["Budget"]
-            a_col = col_map["Actuals"]
-            bal_col = col_map["Balance"]
-            for r in range(3, ws_piv.max_row + 1):
-                # Keep TOTAL row formula too (Budget may be blank -> Balance blank/0; that's fine)
+        if b_col and a_col and bal_col:
+            for r in range(data_start, data_end + 1):
                 b_cell = ws_piv.cell(row=r, column=b_col).coordinate
                 a_cell = ws_piv.cell(row=r, column=a_col).coordinate
                 ws_piv.cell(row=r, column=bal_col).value = f"={b_cell}-{a_cell}"
 
-            # Conditional formatting: green if >0, red if <0 on Balance column (data rows only)
+            # Conditional formatting on Balance (green positive / red negative)
             bal_letter = get_column_letter(bal_col)
-            rng = f"{bal_letter}3:{bal_letter}{ws_piv.max_row}"
+            rng = f"{bal_letter}{data_start}:{bal_letter}{data_end}"
             ws_piv.conditional_formatting.add(
                 rng,
                 CellIsRule(operator="greaterThan", formula=["0"], font=Font(color="004B00", bold=True)),
@@ -465,11 +448,26 @@ def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFra
                 CellIsRule(operator="lessThan", formula=["0"], font=Font(color="8B0000", bold=True)),
             )
 
-        # Emphasize TOTAL row (last row)
-        total_row = ws_piv.max_row
+        # Totals row with SUM formulas (always sums rows above)
+        total_row = ws_piv.max_row + 1
+        ws_piv.cell(row=total_row, column=col_map["Category"]).value = "TOTAL"
+
+        def set_sum_total(col_name: str):
+            if col_name not in col_map:
+                return
+            c = col_map[col_name]
+            col_letter = get_column_letter(c)
+            ws_piv.cell(row=total_row, column=c).value = f"=SUM({col_letter}{data_start}:{col_letter}{data_end})"
+            ws_piv.cell(row=total_row, column=c).number_format = numbers.FORMAT_CURRENCY_USD_SIMPLE
+
+        set_sum_total("Budget")
+        set_sum_total("Actuals")
+        set_sum_total("Balance")
+
+        # Style totals row
         fill = PatternFill(start_color="FFFAD7", end_color="FFFAD7", fill_type="solid")
         for cell in ws_piv[total_row]:
-            cell.font = Font(bold=True, size=12)
+            cell.font = Font(bold=True, size=13)
             cell.fill = fill
 
         _auto_width(ws_piv)
@@ -486,8 +484,7 @@ st.markdown(
     <div style="padding: 1rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 1rem;">
       <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
       <div style="opacity: 0.85; margin-top: 0.25rem;">
-        Generate PI-level budget reports from a PPM (Aggie Enterprise) export or build a GL pivot (Actuals by Category).
-        Award Info is optional and only used to apply indirect rates (PPM mode only).
+        Generate PI-level budget reports from a PPM (Aggie Enterprise) export or build a GL expenses workbook.
         <br/>Report bugs to David Railton Garrett drgarrett@ucdavis.edu
       </div>
     </div>
@@ -511,7 +508,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown("## Choose database type")
+st.markdown("### Step 1 — Choose database type")
 db_type = st.radio(
     "Which database are you uploading?",
     options=["PPM", "GL"],
@@ -527,13 +524,10 @@ with st.expander("Debug options", expanded=False):
     show_key_samples = st.checkbox("Show key samples from both files", value=True)
 
 db_file = st.file_uploader(
-    "Upload PPM Database (Aggie Enterprise)"
-    if db_type == "PPM"
-    else "Upload GL Database (General Ledger export)",
+    "Upload PPM Database (Aggie Enterprise / PPM export)" if db_type == "PPM" else "Upload GL Database (General Ledger export)",
     type=["xlsx"],
 )
 
-# Award doc + indirect toggles are only relevant in PPM mode
 award_file = None
 hide_indirect_in_output = True
 if db_type == "PPM":
@@ -551,19 +545,17 @@ if db_file:
             xl_gl = pd.ExcelFile(BytesIO(db_bytes))
             gl_sheet = st.selectbox("GL sheet to use", options=xl_gl.sheet_names, index=0)
 
-            required = [GL_COL_CATEGORY, GL_COL_ACTUALS, GL_COL_PERIOD, GL_COL_ACTIVITY, GL_COL_FIN_DEPT]
-
-            # Auto-detect header row + read
+            # Header detection should rely on the 4 core columns (more robust),
+            # NOT on Financial Department / Description (which may vary by export)
+            required_for_header = [GL_COL_CATEGORY, GL_COL_ACTUALS, GL_COL_PERIOD, GL_COL_ACTIVITY]
             df_gl, detected_header_row0 = read_gl_with_auto_header(
                 db_bytes=db_bytes,
                 sheet_name=gl_sheet,
-                required_cols=required,
+                required_cols=required_for_header,
                 search_rows=80,
             )
-
             st.caption(f"Detected header row at Excel row **{detected_header_row0 + 1}**.")
 
-            # Optional override
             override = st.checkbox("Override detected header row", value=False)
             if override:
                 override_row_excel = st.number_input(
@@ -576,15 +568,16 @@ if db_file:
                 df_gl.columns = normalize_columns(df_gl.columns)
                 st.caption(f"Using overridden header row at Excel row **{int(override_row_excel)}**.")
 
-            # Find required columns (exact or keyword-based)
+            # Detect needed columns from the detected header
             col_category = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_CATEGORY, keywords=["category"])
             col_actuals = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_ACTUALS, keywords=["actual"])
             col_period = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_PERIOD, keywords=["accounting", "period"])
             col_activity = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_ACTIVITY, keywords=["activity", "code"])
             col_fin_dept = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_FIN_DEPT, keywords=["financial", "department"])
+            col_desc = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_DESC, keywords=["description"])
 
-            # Subset to only those columns (include Financial Department)
-            df_subset = df_gl[[col_category, col_actuals, col_period, col_activity, col_fin_dept]].copy()
+            # Subset to selected columns (include Financial Department + Description)
+            df_subset = df_gl[[col_category, col_actuals, col_period, col_activity, col_fin_dept, col_desc]].copy()
             df_subset = df_subset.rename(
                 columns={
                     col_category: GL_COL_CATEGORY,
@@ -592,6 +585,7 @@ if db_file:
                     col_period: GL_COL_PERIOD,
                     col_activity: GL_COL_ACTIVITY,
                     col_fin_dept: GL_COL_FIN_DEPT,
+                    col_desc: GL_COL_DESC,
                 }
             )
 
@@ -602,7 +596,10 @@ if db_file:
                 & df_subset[GL_COL_CATEGORY].ne("")
             ]
 
-            # Choose title department value
+            # Add Notes column for transactions
+            df_subset["Notes"] = ""
+
+            # Determine title department value
             dept_vals = [d for d in df_subset[GL_COL_FIN_DEPT].apply(safe_str).unique().tolist() if safe_str(d)]
             if len(dept_vals) == 1:
                 dept_name = dept_vals[0]
@@ -620,7 +617,6 @@ if db_file:
             pivot = (
                 df_subset.groupby(GL_COL_CATEGORY, dropna=False, as_index=False)[GL_COL_ACTUALS]
                 .sum()
-                .rename(columns={GL_COL_ACTUALS: GL_COL_ACTUALS})
                 .sort_values(by=GL_COL_ACTUALS, ascending=False, na_position="last")
             )
 
@@ -646,7 +642,7 @@ if db_file:
             st.stop()
 
         # ============================================================
-        # PPM MODE (unchanged)
+        # PPM MODE
         # ============================================================
         df_master, report_date = read_aggy_master(db_bytes)
 
@@ -757,15 +753,9 @@ if db_file:
         if st.button("Generate ZIP (one Excel per PI)", type="primary"):
             df_work_full = df_master_view.copy()
 
-            project_col = find_column_by_exact_or_keywords(
-                df_work_full.columns, PROJECT_COL_NAME, keywords=["project", "number"]
-            )
-            task_name_col = find_column_by_exact_or_keywords(
-                df_work_full.columns, TASK_NAME_COL_NAME, keywords=["task", "name"]
-            )
-            task_num_col = find_column_by_exact_or_keywords(
-                df_work_full.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"]
-            )
+            project_col = find_column_by_exact_or_keywords(df_work_full.columns, PROJECT_COL_NAME, keywords=["project", "number"])
+            task_name_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NAME_COL_NAME, keywords=["task", "name"])
+            task_num_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"])
 
             balance_candidates = [c for c in df_work_full.columns if str(c).startswith("Budget Balance")]
             if not balance_candidates:
@@ -794,11 +784,7 @@ if db_file:
             df_work[project_col] = (p + "-" + t).str.strip("-")
 
             if "Project Name" in df_work.columns:
-                df_work["Project Name"] = (
-                    df_work["Project Name"].apply(safe_str)
-                    + " – "
-                    + df_work[task_name_col].apply(safe_str)
-                )
+                df_work["Project Name"] = df_work["Project Name"].apply(safe_str) + " – " + df_work[task_name_col].apply(safe_str)
 
             df_work = df_work.drop(columns=[task_name_col, task_num_col], errors="ignore")
             df_work = df_work.rename(columns={"Budget": "Allocated Budget", balance_col: "Current Balance"})
@@ -880,4 +866,3 @@ if db_file:
             st.code(traceback.format_exc())
 else:
     st.info("Choose PPM or GL, then upload the corresponding database file. (Award Info is only available in PPM mode.)")
-
