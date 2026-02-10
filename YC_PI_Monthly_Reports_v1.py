@@ -23,7 +23,6 @@ from openpyxl.formatting.rule import CellIsRule
 #     * Pulls Description + Financial Department
 #     * Adds Notes (blank) columns for manual entry
 #     * Output workbook:
-#         - GL_Subset: transactions (selected cols + Financial Department + Description + Notes)
 #         - GL_Pulled_Columns_Check: ONLY pulled cols (no Notes) for verification
 #         - Pivot_By_Category:
 #           Category | Budget(blank) | Actuals | Balance (=Budget-Actuals) | Notes(blank)
@@ -51,6 +50,11 @@ SUMMARY_SHEET_NAME = "Summary"
 HEADER_ROW_INDEX = 17  # 0-based index: Excel row 18 (i.e., delete first 17 rows)
 REPORT_RUNDATE_ROW0 = 2
 REPORT_RUNDATE_COL0 = 0
+
+# Optional debug toggles (kept as constants to avoid UI clutter)
+show_trace = False
+show_key_samples = False
+show_unmatched = False
 
 # PPM column identifiers
 PI_COL_NAME = "Project Principal Investigator"
@@ -332,7 +336,6 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
 
                 # Style
                 ws = wb["Budget Summary"]
-                # Use existing style logic but bump font sizes and add alternating shading
                 _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=12)
 
                 # Optional hide indirect column
@@ -370,7 +373,7 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
 
 
 # -----------------------------
-# GL output builder (3-sheet workbook)
+# GL output builder (NO GL_Subset sheet)
 # -----------------------------
 def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFrame, dept_name: str) -> bytes:
     dept_name_clean = safe_str(dept_name) or "Financial Department"
@@ -392,16 +395,11 @@ def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFra
 
     xbuf = BytesIO()
     with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
-        df_subset.to_excel(writer, index=False, sheet_name="GL_Subset")
+        # NOTE: GL_Subset removed per request
         df_check.to_excel(writer, index=False, sheet_name="GL_Pulled_Columns_Check")
         piv.to_excel(writer, index=False, sheet_name="Pivot_By_Category")
 
         wb = writer.book
-
-        # ---- GL_Subset styling ----
-        ws_sub = wb["GL_Subset"]
-        _style_table_sheet(ws_sub, header_row=1, start_data_row=2, currency_headers=[GL_COL_ACTUALS], font_size=12)
-        _auto_width(ws_sub)
 
         # ---- Check sheet styling ----
         ws_chk = wb["GL_Pulled_Columns_Check"]
@@ -484,7 +482,7 @@ st.markdown(
     <div style="padding: 1rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 1rem;">
       <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
       <div style="opacity: 0.85; margin-top: 0.25rem;">
-        Generate PI-level budget reports from a PPM (Aggie Enterprise) export or build a GL expenses workbook.
+        Generate PI-level budget reports from a PPM (Aggie Enterprise) or build a GL expenses table.
         <br/>Report bugs to David Railton Garrett drgarrett@ucdavis.edu
       </div>
     </div>
@@ -492,26 +490,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Best-effort radio blue (reliable method is Streamlit theme config)
-st.markdown(
-    """
-    <style>
-      div[role="radiogroup"] input[type="radio"]:checked + div {
-        background: #1f77ff !important;
-        border-color: #1f77ff !important;
-      }
-      div[role="radiogroup"] input[type="radio"] + div {
-        border-color: #1f77ff !important;
-      }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# NOTE: Removed the radio-button "blue highlight" CSS block per request.
 
-st.markdown("#### Choose database type")
+st.markdown("### Choose database type")
 db_type = st.radio(
     "Which database are you uploading?",
-    options=["PPM", "GL"],
+    options=["PPM (Monthly Budget)", "GL (YTD Expense Table)"],
     index=0,
     horizontal=True,
     help="PPM = Aggie Enterprise (PPM export). GL = General Ledger export.",
@@ -591,7 +575,7 @@ if db_file:
                 & df_subset[GL_COL_CATEGORY].ne("")
             ]
 
-            # Add Notes column for transactions
+            # Add Notes column for transactions (used for preview; not exported as GL_Subset anymore)
             df_subset["Notes"] = ""
 
             # Determine title department value
@@ -620,7 +604,7 @@ if db_file:
 
             report_label = st.text_input("Report label (used in filename)", value=f"{dept_name} Expenses")
 
-            if st.button("Generate GL Excel (transactions + pivot)", type="primary"):
+            if st.button("Generate GL Excel (pivot + check sheet)", type="primary"):
                 xlsx_bytes = build_gl_excel(
                     df_subset=df_subset,
                     pivot_categories_actuals=pivot[[GL_COL_CATEGORY, GL_COL_ACTUALS]].copy(),
