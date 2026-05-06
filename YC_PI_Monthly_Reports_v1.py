@@ -363,8 +363,6 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
 
     footnote = (
         "* Calculated minus the indirect costs, if applicable."
-        if applied_indirects
-        else "* Indirect costs not applied (no Award Info document, or no indirect rates found)."
     )
 
     # Financial columns that receive positive/negative color formatting
