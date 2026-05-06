@@ -15,6 +15,11 @@ from openpyxl.formatting.rule import CellIsRule
 #     * PPM (Aggie Enterprise / PPM export)
 #     * GL  (General Ledger export)
 # - Award Info Document is OPTIONAL (PPM only)
+# - PPM:
+#     * Automatically filters rows where Award Status, Project Status,
+#       or Task Status == "INACTIVE" (case-insensitive)
+#     * Positive financial values colored GREEN + bold in output
+#     * Negative financial values colored RED + bold in output
 # - GL:
 #     * User chooses sheet
 #     * Header row auto-detected WITHOUT needing exact header row
@@ -32,10 +37,6 @@ from openpyxl.formatting.rule import CellIsRule
 #         - Larger fonts + alternating light-green rows for readability
 # - UI:
 #     * If GL selected, Award uploader + indirect toggle hidden
-# - Recent changes:
-#     * Removed radio "blue highlight" CSS styling
-#     * Removed GL output sheet "GL_Subset"
-#     * Fixed db_type comparisons so PPM/GL upload UI toggles correctly
 # ============================================================
 
 # -----------------------------
@@ -55,7 +56,7 @@ HEADER_ROW_INDEX = 17  # 0-based index: Excel row 18 (i.e., delete first 17 rows
 REPORT_RUNDATE_ROW0 = 2
 REPORT_RUNDATE_COL0 = 0
 
-# Optional debug toggles (kept as constants to avoid UI clutter)
+# Optional debug toggles
 show_trace = False
 show_key_samples = False
 show_unmatched = False
@@ -66,6 +67,8 @@ PROJECT_COL_NAME = "Project Number"
 TASK_NAME_COL_NAME = "Task Name"
 TASK_NUMBER_COL_NAME = "Task Number"
 STATUS_COL_NAME = "Project Status"
+AWARD_STATUS_COL_NAME = "Award Status"
+TASK_STATUS_COL_NAME = "Task Status"
 
 ALLOC_BUDGET_NET_COL = "Allocated Budget*"
 CURRENT_BAL_NET_COL = "Current Balance*"
@@ -77,6 +80,10 @@ GL_COL_PERIOD = "Accounting Period"
 GL_COL_ACTIVITY = "Activity"
 GL_COL_FIN_DEPT = "Financial Department"
 GL_COL_DESC = "Description"
+
+# Color constants for financial value formatting
+COLOR_POSITIVE_GREEN = "004B00"   # dark green text
+COLOR_NEGATIVE_RED   = "8B0000"   # dark red text
 
 # -----------------------------
 # Helpers
@@ -118,16 +125,22 @@ def find_column_by_exact_or_keywords(columns, target_name, keywords=None):
     columns = list(columns)
     if target_name in columns:
         return target_name
-
     if keywords:
         lowered = [c.lower() for c in columns]
         for col, low in zip(columns, lowered):
             if all(k.lower() in low for k in keywords):
                 return col
-
     raise KeyError(
         f"Could not find a suitable column for '{target_name}'. Available columns: {columns}"
     )
+
+
+def find_column_loose(columns, target: str):
+    """Return the first column name matching target (case-insensitive, whitespace-normalized), or None."""
+    for col in columns:
+        if safe_str(col).strip().lower() == target.strip().lower():
+            return col
+    return None
 
 
 def normalize_pi_last_first(pi_val: str) -> str:
@@ -147,6 +160,23 @@ def make_safe_filename_fragment(name: str) -> str:
     frag = re.sub(r'[\/:*?"<>|]+', "_", frag)
     frag = frag.strip().strip(".")
     return frag[:120] if frag else "Report"
+
+
+# -----------------------------
+# PPM: inactive-row filter
+# -----------------------------
+def filter_inactive_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove rows where ANY of Award Status, Project Status, or Task Status
+    equals 'INACTIVE' (case-insensitive).
+    Columns that are absent in the DataFrame are silently skipped.
+    """
+    status_cols_to_check = [AWARD_STATUS_COL_NAME, STATUS_COL_NAME, TASK_STATUS_COL_NAME]
+    for target in status_cols_to_check:
+        matched = find_column_loose(df.columns, target)
+        if matched:
+            df = df[~df[matched].apply(safe_str).str.upper().eq("INACTIVE")]
+    return df
 
 
 # -----------------------------
@@ -170,19 +200,15 @@ def _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=None
     - Currency formatting for specified header names
     """
     currency_headers = currency_headers or []
-
     header_font = Font(bold=True, size=font_size + 1)
     body_font = Font(size=font_size)
 
-    # Header styling
     for cell in next(ws.iter_rows(min_row=header_row, max_row=header_row)):
         cell.font = header_font
 
-    # Map headers to column letters
     headers = [c.value for c in next(ws.iter_rows(min_row=header_row, max_row=header_row))]
     header_to_col = {h: get_column_letter(i + 1) for i, h in enumerate(headers)}
 
-    # Alternating fill
     fill_green = PatternFill(start_color="FFE6F4EA", end_color="FFE6F4EA", fill_type="solid")
 
     for r in range(start_data_row, ws.max_row + 1):
@@ -191,7 +217,6 @@ def _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=None
             if (r - start_data_row) % 2 == 1:
                 cell.fill = fill_green
 
-    # Currency formatting
     for h in currency_headers:
         if h in header_to_col:
             col_letter = header_to_col[h]
@@ -199,6 +224,40 @@ def _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=None
                 if cell.row <= header_row:
                     continue
                 cell.number_format = numbers.FORMAT_CURRENCY_USD_SIMPLE
+
+
+def _apply_financial_color_formatting(ws, financial_col_names: list, header_row: int, start_data_row: int, end_data_row: int, font_size: int = 12):
+    """
+    For each specified financial column, apply:
+      - GREEN bold text for positive values
+      - RED bold text for negative values
+    Uses openpyxl conditional formatting rules.
+    """
+    headers = [c.value for c in next(ws.iter_rows(min_row=header_row, max_row=header_row))]
+    col_map = {h: idx + 1 for idx, h in enumerate(headers)}
+
+    for col_name in financial_col_names:
+        if col_name not in col_map:
+            continue
+        col_letter = get_column_letter(col_map[col_name])
+        rng = f"{col_letter}{start_data_row}:{col_letter}{end_data_row}"
+
+        ws.conditional_formatting.add(
+            rng,
+            CellIsRule(
+                operator="greaterThan",
+                formula=["0"],
+                font=Font(color=COLOR_POSITIVE_GREEN, bold=True, size=font_size),
+            ),
+        )
+        ws.conditional_formatting.add(
+            rng,
+            CellIsRule(
+                operator="lessThan",
+                formula=["0"],
+                font=Font(color=COLOR_NEGATIVE_RED, bold=True, size=font_size),
+            ),
+        )
 
 
 # -----------------------------
@@ -215,7 +274,7 @@ def read_aggy_master(master_bytes: bytes):
     report_date = extract_report_run_date_from_cell(report_cell)
 
     header = df_raw.iloc[HEADER_ROW_INDEX]
-    df = df_raw.iloc[HEADER_ROW_INDEX + 1 :].copy()
+    df = df_raw.iloc[HEADER_ROW_INDEX + 1:].copy()
     df.columns = header
     df = df.dropna(how="all")
     df.columns = normalize_columns(df.columns)
@@ -242,7 +301,6 @@ def best_effort_match(col: str, required: str) -> bool:
         return False
     if c == required.lower():
         return True
-
     req_keywords = {
         GL_COL_CATEGORY: ["category"],
         GL_COL_ACTUALS: ["actual"],
@@ -258,31 +316,22 @@ def best_effort_match(col: str, required: str) -> bool:
 def detect_header_row_from_required_cols(raw_df: pd.DataFrame, required_cols: list, search_rows: int = 80) -> int:
     best_row = None
     best_score = -1
-
     max_r = min(search_rows, len(raw_df))
     for r in range(max_r):
         headers = [normalize_header_cell(v) for v in raw_df.iloc[r].tolist()]
-
-        score = 0
-        for req in required_cols:
-            if any(best_effort_match(h, req) for h in headers):
-                score += 1
-
+        score = sum(1 for req in required_cols if any(best_effort_match(h, req) for h in headers))
         if score > best_score:
             best_score = score
             best_row = r
-
         if best_score == len(required_cols):
             break
 
-    # Require at least len(required_cols)-1 matches (robust but not too strict)
     min_needed = max(1, len(required_cols) - 1)
     if best_row is None or best_score < min_needed:
         raise KeyError(
             f"Could not detect a header row with at least {min_needed} of {len(required_cols)} "
             f"required columns: {required_cols}. Tried first {max_r} rows."
         )
-
     return best_row
 
 
@@ -318,6 +367,9 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
         else "* Indirect costs not applied (no Award Info document, or no indirect rates found)."
     )
 
+    # Financial columns that receive positive/negative color formatting
+    financial_color_cols = [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"]
+
     zip_buf = BytesIO()
     used_names = set()
 
@@ -331,15 +383,27 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
                 group[ALLOC_BUDGET_NET_COL] = pd.to_numeric(group[ALLOC_BUDGET_NET_COL], errors="coerce")
                 group = group.sort_values(by=ALLOC_BUDGET_NET_COL, ascending=False, na_position="last")
 
-            currency_cols = [c for c in [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"] if c in group.columns]
+            currency_cols = [c for c in financial_color_cols if c in group.columns]
 
             xbuf = BytesIO()
             with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
                 group.to_excel(writer, index=False, sheet_name="Budget Summary")
                 wb = writer.book
-
                 ws = wb["Budget Summary"]
+
                 _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=12)
+
+                # Apply green/red bold color formatting to financial columns
+                data_end_row = ws.max_row
+                if data_end_row >= 2:
+                    _apply_financial_color_formatting(
+                        ws,
+                        financial_col_names=currency_cols,
+                        header_row=1,
+                        start_data_row=2,
+                        end_data_row=data_end_row,
+                        font_size=12,
+                    )
 
                 if hide_indirect and "Indirect Rate" in group.columns:
                     headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
@@ -375,7 +439,7 @@ def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_
 
 
 # -----------------------------
-# GL output builder (NO GL_Subset sheet)
+# GL output builder
 # -----------------------------
 def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFrame, dept_name: str) -> bytes:
     dept_name_clean = safe_str(dept_name) or "Financial Department"
@@ -389,8 +453,8 @@ def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFra
     piv = piv.sort_values(by="Actuals", ascending=False, na_position="last")
 
     piv.insert(1, "Budget", "")
-    piv["Balance"] = ""   # formula in Excel
-    piv["Notes"] = ""     # manual
+    piv["Balance"] = ""
+    piv["Notes"] = ""
 
     xbuf = BytesIO()
     with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
@@ -412,7 +476,7 @@ def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFra
         _style_table_sheet(ws_piv, header_row=2, start_data_row=3, currency_headers=["Budget", "Actuals", "Balance"], font_size=12)
 
         headers = [c.value for c in next(ws_piv.iter_rows(min_row=2, max_row=2))]
-        col_map = {name: idx + 1 for idx, name in enumerate(headers)}  # 1-based index
+        col_map = {name: idx + 1 for idx, name in enumerate(headers)}
 
         data_start = 3
         data_end = ws_piv.max_row
@@ -431,11 +495,11 @@ def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFra
             rng = f"{bal_letter}{data_start}:{bal_letter}{data_end}"
             ws_piv.conditional_formatting.add(
                 rng,
-                CellIsRule(operator="greaterThan", formula=["0"], font=Font(color="004B00", bold=True)),
+                CellIsRule(operator="greaterThan", formula=["0"], font=Font(color=COLOR_POSITIVE_GREEN, bold=True)),
             )
             ws_piv.conditional_formatting.add(
                 rng,
-                CellIsRule(operator="lessThan", formula=["0"], font=Font(color="8B0000", bold=True)),
+                CellIsRule(operator="lessThan", formula=["0"], font=Font(color=COLOR_NEGATIVE_RED, bold=True)),
             )
 
         total_row = ws_piv.max_row + 1
@@ -479,8 +543,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
-# Removed the radio "blue highlight" CSS block per request.
 
 st.markdown("### Choose database type")
 
@@ -563,7 +625,6 @@ if db_file:
                 df_subset[GL_COL_CATEGORY].str.upper().ne("N/A")
                 & df_subset[GL_COL_CATEGORY].ne("")
             ]
-
             df_subset["Notes"] = ""
 
             dept_vals = [d for d in df_subset[GL_COL_FIN_DEPT].apply(safe_str).unique().tolist() if safe_str(d)]
@@ -621,6 +682,14 @@ if db_file:
         do_active_only = st.checkbox("Keep only ACTIVE Projects", value=True)
         status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["project", "status"])
         df_master_view = df_master[df_master[status_col] == "ACTIVE"].copy() if do_active_only else df_master.copy()
+
+        # --- Filter out INACTIVE rows (Award Status, Project Status, Task Status) ---
+        rows_before = len(df_master_view)
+        df_master_view = filter_inactive_rows(df_master_view)
+        rows_after = len(df_master_view)
+        rows_removed = rows_before - rows_after
+        if rows_removed > 0:
+            st.info(f"ℹ️ {rows_removed} row(s) removed because Award Status, Project Status, or Task Status was 'Inactive'.")
 
         df_award = None
         has_award = award_file is not None
