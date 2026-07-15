@@ -531,69 +531,62 @@ def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFra
 # -----------------------------
 st.markdown(
     """
-    <div style="padding: 0.85rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 0.75rem;">
-      <div style="font-size: 1.25rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
-      <div style="opacity: 0.85; margin-top: 0.15rem; font-size: 0.9rem;">
-        Generate PI-level budget reports from a PPM (Aggie Enterprise) export, or build a GL expenses table.
-        &nbsp;·&nbsp; Bugs to David Railton Garrett — drgarrett@ucdavis.edu
+    <div style="padding: 1rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 1rem;">
+      <div style="font-size: 1.35rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
+      <div style="opacity: 0.85; margin-top: 0.25rem;">
+        Generate PI-level budget reports from a PPM (Aggie Enterprise) or build a GL expenses table.
+        <br/>Report bugs to David Railton Garrett drgarrett@ucdavis.edu
       </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+st.markdown("### Choose database type")
+
 PPM_OPTION = "PPM (Monthly Budget)"
 GL_OPTION = "GL (YTD Expense Table)"
 
-# -----------------------------
-# Sidebar: setup / inputs
-# -----------------------------
-with st.sidebar:
-    st.markdown("#### Setup")
-    db_type = st.radio(
-        "Database type",
-        options=[PPM_OPTION, GL_OPTION],
-        index=0,
-        help="PPM = Aggie Enterprise (PPM export). GL = General Ledger export.",
-    )
-    db_file = st.file_uploader(
-        "PPM database (.xlsx)" if db_type == PPM_OPTION else "GL database (.xlsx)",
-        type=["xlsx"],
-    )
+db_type = st.radio(
+    "Which database are you uploading?",
+    options=[PPM_OPTION, GL_OPTION],
+    index=0,
+    horizontal=True,
+    help="PPM = Aggie Enterprise (PPM export). GL = General Ledger export.",
+)
+st.markdown("---")
 
-    award_file = None
-    hide_indirect_in_output = True
-    if db_type == PPM_OPTION:
-        st.markdown("#### Award Info (optional)")
-        award_file = st.file_uploader("Award Info document (.xlsx)", type=["xlsx"])
-        hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in output", value=True)
+db_file = st.file_uploader(
+    "Upload PPM Database (Aggie Enterprise / PPM export)" if db_type == PPM_OPTION else "Upload GL Database (General Ledger export)",
+    type=["xlsx"],
+)
 
-if not db_file:
-    st.info(
-        "Choose PPM or GL in the sidebar, then upload the corresponding database file. "
-        "Award Info is only available in PPM mode."
-    )
-    st.stop()
+award_file = None
+hide_indirect_in_output = True
+if db_type == PPM_OPTION:
+    award_file = st.file_uploader("Upload Award Info Document (Excel) — optional", type=["xlsx"])
+    hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in resulting download", value=True)
 
-try:
-    db_bytes = db_file.getvalue()
+if db_file:
+    try:
+        db_bytes = db_file.getvalue()
 
-    # ============================================================
-    # GL MODE
-    # ============================================================
-    if db_type == GL_OPTION:
-        xl_gl = pd.ExcelFile(BytesIO(db_bytes))
-        gl_sheet = st.selectbox("GL sheet to use", options=xl_gl.sheet_names, index=0)
+        # ============================================================
+        # GL MODE
+        # ============================================================
+        if db_type == GL_OPTION:
+            xl_gl = pd.ExcelFile(BytesIO(db_bytes))
+            gl_sheet = st.selectbox("GL sheet to use", options=xl_gl.sheet_names, index=0)
 
-        required_for_header = [GL_COL_CATEGORY, GL_COL_ACTUALS, GL_COL_PERIOD, GL_COL_ACTIVITY]
-        df_gl, detected_header_row0 = read_gl_with_auto_header(
-            db_bytes=db_bytes,
-            sheet_name=gl_sheet,
-            required_cols=required_for_header,
-            search_rows=80,
-        )
+            required_for_header = [GL_COL_CATEGORY, GL_COL_ACTUALS, GL_COL_PERIOD, GL_COL_ACTIVITY]
+            df_gl, detected_header_row0 = read_gl_with_auto_header(
+                db_bytes=db_bytes,
+                sheet_name=gl_sheet,
+                required_cols=required_for_header,
+                search_rows=80,
+            )
+            st.caption(f"Detected header row at Excel row **{detected_header_row0 + 1}**.")
 
-        with st.expander(f"Header row detected at Excel row {detected_header_row0 + 1} — override?", expanded=False):
             override = st.checkbox("Override detected header row", value=False)
             if override:
                 override_row_excel = st.number_input(
@@ -606,121 +599,117 @@ try:
                 df_gl.columns = normalize_columns(df_gl.columns)
                 st.caption(f"Using overridden header row at Excel row **{int(override_row_excel)}**.")
 
-        col_category = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_CATEGORY, keywords=["category"])
-        col_actuals = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_ACTUALS, keywords=["actual"])
-        col_period = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_PERIOD, keywords=["accounting", "period"])
-        col_activity = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_ACTIVITY, keywords=["activity", "code"])
-        col_fin_dept = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_FIN_DEPT, keywords=["financial", "department"])
-        col_desc = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_DESC, keywords=["description"])
+            col_category = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_CATEGORY, keywords=["category"])
+            col_actuals = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_ACTUALS, keywords=["actual"])
+            col_period = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_PERIOD, keywords=["accounting", "period"])
+            col_activity = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_ACTIVITY, keywords=["activity", "code"])
+            col_fin_dept = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_FIN_DEPT, keywords=["financial", "department"])
+            col_desc = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_DESC, keywords=["description"])
 
-        df_subset = df_gl[[col_category, col_actuals, col_period, col_activity, col_fin_dept, col_desc]].copy()
-        df_subset = df_subset.rename(
-            columns={
-                col_category: GL_COL_CATEGORY,
-                col_actuals: GL_COL_ACTUALS,
-                col_period: GL_COL_PERIOD,
-                col_activity: GL_COL_ACTIVITY,
-                col_fin_dept: GL_COL_FIN_DEPT,
-                col_desc: GL_COL_DESC,
-            }
-        )
+            df_subset = df_gl[[col_category, col_actuals, col_period, col_activity, col_fin_dept, col_desc]].copy()
+            df_subset = df_subset.rename(
+                columns={
+                    col_category: GL_COL_CATEGORY,
+                    col_actuals: GL_COL_ACTUALS,
+                    col_period: GL_COL_PERIOD,
+                    col_activity: GL_COL_ACTIVITY,
+                    col_fin_dept: GL_COL_FIN_DEPT,
+                    col_desc: GL_COL_DESC,
+                }
+            )
 
-        df_subset[GL_COL_CATEGORY] = df_subset[GL_COL_CATEGORY].apply(safe_str)
-        df_subset = df_subset[
-            df_subset[GL_COL_CATEGORY].str.upper().ne("N/A")
-            & df_subset[GL_COL_CATEGORY].ne("")
-        ]
-        df_subset["Notes"] = ""
+            df_subset[GL_COL_CATEGORY] = df_subset[GL_COL_CATEGORY].apply(safe_str)
+            df_subset = df_subset[
+                df_subset[GL_COL_CATEGORY].str.upper().ne("N/A")
+                & df_subset[GL_COL_CATEGORY].ne("")
+            ]
+            df_subset["Notes"] = ""
 
-        dept_vals = [d for d in df_subset[GL_COL_FIN_DEPT].apply(safe_str).unique().tolist() if safe_str(d)]
-        if len(dept_vals) == 1:
-            dept_name = dept_vals[0]
-        elif len(dept_vals) == 0:
-            dept_name = "Financial Department"
-        else:
-            dept_name = "Multiple Departments"
+            dept_vals = [d for d in df_subset[GL_COL_FIN_DEPT].apply(safe_str).unique().tolist() if safe_str(d)]
+            if len(dept_vals) == 1:
+                dept_name = dept_vals[0]
+            elif len(dept_vals) == 0:
+                dept_name = "Financial Department"
+            else:
+                dept_name = "Multiple Departments"
 
-        df_subset[GL_COL_ACTUALS] = pd.to_numeric(df_subset[GL_COL_ACTUALS], errors="coerce").fillna(0.0)
-
-        pivot = (
-            df_subset.groupby(GL_COL_CATEGORY, dropna=False, as_index=False)[GL_COL_ACTUALS]
-            .sum()
-            .sort_values(by=GL_COL_ACTUALS, ascending=False, na_position="last")
-        )
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Transactions", len(df_subset))
-        m2.metric("Categories", df_subset[GL_COL_CATEGORY].nunique())
-        m3.metric("Department", dept_name)
-
-        tab_txn, tab_pivot = st.tabs(["Transactions", "Pivot by Category"])
-        with tab_txn:
+            st.markdown("### GL Preview (transactions subset)")
             st.dataframe(df_subset.head(50), use_container_width=True)
-        with tab_pivot:
+
+            df_subset[GL_COL_ACTUALS] = pd.to_numeric(df_subset[GL_COL_ACTUALS], errors="coerce").fillna(0.0)
+
+            pivot = (
+                df_subset.groupby(GL_COL_CATEGORY, dropna=False, as_index=False)[GL_COL_ACTUALS]
+                .sum()
+                .sort_values(by=GL_COL_ACTUALS, ascending=False, na_position="last")
+            )
+
+            st.markdown("### Pivot Preview (Actuals by Category)")
             st.dataframe(pivot, use_container_width=True)
 
-        report_label = st.text_input("Report label (used in filename)", value=f"{dept_name} Expenses")
+            report_label = st.text_input("Report label (used in filename)", value=f"{dept_name} Expenses")
 
-        if st.button("Generate GL Excel (pivot + check sheet)", type="primary", use_container_width=True):
-            xlsx_bytes = build_gl_excel(
-                df_subset=df_subset,
-                pivot_categories_actuals=pivot[[GL_COL_CATEGORY, GL_COL_ACTUALS]].copy(),
-                dept_name=dept_name,
-            )
-            st.success("GL Excel generated!")
-            st.download_button(
-                "Download GL Excel",
-                data=xlsx_bytes,
-                file_name=f"{make_safe_filename_fragment(report_label)}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            if st.button("Generate GL Excel (pivot + check sheet)", type="primary"):
+                xlsx_bytes = build_gl_excel(
+                    df_subset=df_subset,
+                    pivot_categories_actuals=pivot[[GL_COL_CATEGORY, GL_COL_ACTUALS]].copy(),
+                    dept_name=dept_name,
+                )
+                st.success("GL Excel generated!")
+                st.download_button(
+                    "Download GL Excel",
+                    data=xlsx_bytes,
+                    file_name=f"{make_safe_filename_fragment(report_label)}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
-        st.stop()
+            st.stop()
 
-    # ============================================================
-    # PPM MODE
-    # ============================================================
-    df_master, report_date = read_aggy_master(db_bytes)
+        # ============================================================
+        # PPM MODE
+        # ============================================================
+        df_master, report_date = read_aggy_master(db_bytes)
 
-    c1, c2 = st.columns([2, 1])
-    with c1:
         if report_date:
-            st.info(f"PPM download date detected: **{report_date}**")
+            st.info(f"PPM download date: **{report_date}**")
             date_label = report_date
         else:
-            st.warning("Could not detect 'Report Run Date' — enter manually.")
+            st.warning("Could not detect 'Report Run Date', please enter a date manually.")
             date_label = st.text_input("Report Date (YYYY-MM-DD)", value="")
-    with c2:
-        st.markdown("&nbsp;")
-        do_active_only = st.checkbox("Active projects only", value=True)
 
-    status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["project", "status"])
-    df_master_view = df_master[df_master[status_col] == "ACTIVE"].copy() if do_active_only else df_master.copy()
+        do_active_only = st.checkbox("Keep only ACTIVE Projects", value=True)
+        status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["project", "status"])
+        df_master_view = df_master[df_master[status_col] == "ACTIVE"].copy() if do_active_only else df_master.copy()
 
-    # --- Filter out INACTIVE rows (Award Status, Project Status, Task Status) ---
-    rows_before = len(df_master_view)
-    df_master_view = filter_inactive_rows(df_master_view)
-    rows_after = len(df_master_view)
-    rows_removed = rows_before - rows_after
-    if rows_removed > 0:
-        st.caption(f"ℹ️ {rows_removed} row(s) removed — Award/Project/Task status was 'Inactive'.")
+        # --- Filter out INACTIVE rows (Award Status, Project Status, Task Status) ---
+        rows_before = len(df_master_view)
+        df_master_view = filter_inactive_rows(df_master_view)
+        rows_after = len(df_master_view)
+        rows_removed = rows_before - rows_after
+        if rows_removed > 0:
+            st.info(f"ℹ️ {rows_removed} row(s) removed because Award Status, Project Status, or Task Status was 'Inactive'.")
 
-    df_award = None
-    has_award = award_file is not None
+        df_award = None
+        has_award = award_file is not None
 
-    if has_award:
-        award_bytes = award_file.getvalue()
-        xl_aw = pd.ExcelFile(BytesIO(award_bytes))
-        award_sheet = st.selectbox("Award sheet to use", options=xl_aw.sheet_names, index=0)
-        df_award = read_award(award_bytes, sheet_name=award_sheet)
+        st.markdown("### Preview (before merge)")
+        if has_award:
+            award_bytes = award_file.getvalue()
+            xl_aw = pd.ExcelFile(BytesIO(award_bytes))
+            award_sheet = st.selectbox("Award sheet to use", options=xl_aw.sheet_names, index=0)
+            df_award = read_award(award_bytes, sheet_name=award_sheet)
 
-        tab_ppm, tab_award = st.tabs(["PPM preview", "Award Info preview"])
-        with tab_ppm:
-            st.dataframe(df_master_view.head(25), use_container_width=True)
-        with tab_award:
-            st.dataframe(df_award.head(25), use_container_width=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**PPM preview**")
+                st.dataframe(df_master_view.head(25), use_container_width=True)
+            with c2:
+                st.markdown("**Award Info preview**")
+                st.dataframe(df_award.head(25), use_container_width=True)
 
-        with st.expander("Merge column settings", expanded=False):
+            st.markdown("---")
+            st.markdown("### Choose which columns to merge by:")
+
             default_master_merge = PROJECT_COL_NAME if PROJECT_COL_NAME in df_master_view.columns else df_master_view.columns[0]
 
             default_aw_merge = None
@@ -731,19 +720,16 @@ try:
             if default_aw_merge is None:
                 default_aw_merge = df_award.columns[0]
 
-            mc1, mc2 = st.columns(2)
-            with mc1:
-                master_merge_col = st.selectbox(
-                    "PPM merge column",
-                    options=list(df_master_view.columns),
-                    index=list(df_master_view.columns).index(default_master_merge) if default_master_merge in df_master_view.columns else 0,
-                )
-            with mc2:
-                award_merge_col = st.selectbox(
-                    "Award Document merge column",
-                    options=list(df_award.columns),
-                    index=list(df_award.columns).index(default_aw_merge) if default_aw_merge in df_award.columns else 0,
-                )
+            master_merge_col = st.selectbox(
+                "PPM merge column",
+                options=list(df_master_view.columns),
+                index=list(df_master_view.columns).index(default_master_merge) if default_master_merge in df_master_view.columns else 0,
+            )
+            award_merge_col = st.selectbox(
+                "Award Document merge column",
+                options=list(df_award.columns),
+                index=list(df_award.columns).index(default_aw_merge) if default_aw_merge in df_award.columns else 0,
+            )
 
             default_aw_rate = None
             for cand in ["INDIRECT RATE", "Indirect Rate", "Indirect rate"]:
@@ -760,23 +746,22 @@ try:
                 index=list(df_award.columns).index(default_aw_rate) if default_aw_rate in df_award.columns else 0,
             )
 
-        master_keys = df_master_view[master_merge_col].apply(canon_key)
-        award_keys = df_award[award_merge_col].apply(canon_key)
+            master_keys = df_master_view[master_merge_col].apply(canon_key)
+            award_keys = df_award[award_merge_col].apply(canon_key)
 
-        master_key_set = set(k for k in master_keys.unique() if k)
-        award_key_set = set(k for k in award_keys.unique() if k)
-        intersect = master_key_set.intersection(award_key_set)
-        match_rate_unique = (len(intersect) / len(master_key_set)) if master_key_set else 0.0
+            master_key_set = set(k for k in master_keys.unique() if k)
+            award_key_set = set(k for k in award_keys.unique() if k)
+            intersect = master_key_set.intersection(award_key_set)
+            match_rate_unique = (len(intersect) / len(master_key_set)) if master_key_set else 0.0
 
-        st.markdown("##### Merge preview")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("PPM projects", len(master_key_set))
-        m2.metric("Award projects", len(award_key_set))
-        m3.metric("Matched", len(intersect))
-        m4.metric("Match rate", f"{match_rate_unique:.1%}")
+            st.markdown("### Merge preview")
+            st.write(f"**# of PPM Projects:** {len(master_key_set)}")
+            st.write(f"**# of Award Info Sheet Projects:** {len(award_key_set)}")
+            st.write(f"**# that match:** {len(intersect)}")
+            st.write(f"**Approx. match rate (unique PPM keys found in award):** {match_rate_unique:.1%}")
 
-        if show_key_samples:
-            with st.expander("Project # samples", expanded=False):
+            if show_key_samples:
+                st.markdown("**Project # Samples:**")
                 c3, c4 = st.columns(2)
                 with c3:
                     st.caption("PPM key sample")
@@ -785,129 +770,131 @@ try:
                     st.caption("Award key sample")
                     st.code(", ".join(list(award_key_set)[:20]) if award_key_set else "(none)")
 
-        if show_unmatched:
-            missing = sorted(list(master_key_set - award_key_set))[:40]
-            if missing:
-                with st.expander("Unmatched PPM projects", expanded=False):
+            if show_unmatched:
+                missing = sorted(list(master_key_set - award_key_set))[:40]
+                if missing:
                     st.warning("Some PPM projects were not found in the Award document:")
                     st.code(", ".join(missing[:40]))
-    else:
-        st.dataframe(df_master_view.head(25), use_container_width=True)
-        st.info("No Award Info document uploaded — reports will be generated WITHOUT indirect calculations.")
-
-    st.divider()
-
-    if st.button("Generate ZIP (one Excel per PI)", type="primary", use_container_width=True):
-        df_work_full = df_master_view.copy()
-
-        project_col = find_column_by_exact_or_keywords(df_work_full.columns, PROJECT_COL_NAME, keywords=["project", "number"])
-        task_name_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NAME_COL_NAME, keywords=["task", "name"])
-        task_num_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"])
-
-        balance_candidates = [c for c in df_work_full.columns if str(c).startswith("Budget Balance")]
-        if not balance_candidates:
-            raise KeyError("PPM document is missing a column starting with 'Budget Balance'.")
-        balance_col = balance_candidates[0]
-
-        keep_cols = []
-        for c in [
-            PI_COL_NAME,
-            project_col,
-            "Project Name",
-            "Project Manager",
-            task_name_col,
-            task_num_col,
-            "Budget",
-            "expenses",
-            balance_col,
-        ]:
-            if c in df_work_full.columns and c not in keep_cols:
-                keep_cols.append(c)
-
-        df_work = df_work_full[keep_cols].copy()
-
-        p = df_work[project_col].apply(safe_str).str.replace(".0", "", regex=False)
-        t = df_work[task_num_col].apply(safe_str).str.replace(".0", "", regex=False)
-        df_work[project_col] = (p + "-" + t).str.strip("-")
-
-        if "Project Name" in df_work.columns:
-            df_work["Project Name"] = df_work["Project Name"].apply(safe_str) + " – " + df_work[task_name_col].apply(safe_str)
-
-        df_work = df_work.drop(columns=[task_name_col, task_num_col], errors="ignore")
-        df_work = df_work.rename(columns={"Budget": "Allocated Budget", balance_col: "Current Balance"})
-
-        if has_award and df_award is not None:
-            df_work["_merge_key"] = df_work_full[master_merge_col].apply(canon_key)
-
-            df_aw = df_award.copy()
-            df_aw["_merge_key"] = df_aw[award_merge_col].apply(canon_key)
-
-            df_aw_sub = df_aw[["_merge_key", award_rate_col]].copy()
-            df_aw_sub = df_aw_sub.drop_duplicates(subset=["_merge_key"], keep="first")
-            df_aw_sub = df_aw_sub.rename(columns={award_rate_col: "Indirect Rate"})
-
-            df_merged = df_work.merge(df_aw_sub, on="_merge_key", how="left").drop(columns=["_merge_key"])
-
-            df_merged["Indirect Rate"] = pd.to_numeric(df_merged["Indirect Rate"], errors="coerce").fillna(0.0)
-            df_merged["Allocated Budget"] = pd.to_numeric(df_merged["Allocated Budget"], errors="coerce")
-            df_merged["Current Balance"] = pd.to_numeric(df_merged["Current Balance"], errors="coerce")
-
-            denom = 1.0 + df_merged["Indirect Rate"]
-            df_merged[ALLOC_BUDGET_NET_COL] = df_merged["Allocated Budget"] / denom
-            df_merged[CURRENT_BAL_NET_COL] = df_merged["Current Balance"] / denom
-
-            df_out = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
         else:
-            df_work["Allocated Budget"] = pd.to_numeric(df_work["Allocated Budget"], errors="coerce")
-            df_work["Current Balance"] = pd.to_numeric(df_work["Current Balance"], errors="coerce")
-            df_work[ALLOC_BUDGET_NET_COL] = df_work["Allocated Budget"]
-            df_work[CURRENT_BAL_NET_COL] = df_work["Current Balance"]
-            df_out = df_work.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
+            st.dataframe(df_master_view.head(25), use_container_width=True)
+            st.info("No Award Info document uploaded — reports will be generated WITHOUT indirect calculations.")
 
-        if safe_str(date_label):
-            df_out["Date Pulled"] = safe_str(date_label)
+        st.markdown("---")
+        st.markdown("### Generate Monthly Reports")
 
-        if PI_COL_NAME not in df_out.columns:
-            raise KeyError(f"PI column '{PI_COL_NAME}' not found in PPM. Columns: {list(df_out.columns)}")
-        df_out[PI_COL_NAME] = df_out[PI_COL_NAME].apply(normalize_pi_last_first)
+        if st.button("Generate ZIP (one Excel per PI)", type="primary"):
+            df_work_full = df_master_view.copy()
 
-        desired = [
-            PI_COL_NAME,
-            "Project Manager",
-            "Date Pulled",
-            project_col,
-            "Project Name",
-            ALLOC_BUDGET_NET_COL,
-            CURRENT_BAL_NET_COL,
-            "Indirect Rate",
-            "expenses",
-        ]
-        desired = [c for c in desired if c in df_out.columns]
-        remaining = [c for c in df_out.columns if c not in desired]
-        df_out = df_out[desired + remaining]
+            project_col = find_column_by_exact_or_keywords(df_work_full.columns, PROJECT_COL_NAME, keywords=["project", "number"])
+            task_name_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NAME_COL_NAME, keywords=["task", "name"])
+            task_num_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"])
 
-        report_label = "Budget Report"
-        if safe_str(date_label):
-            report_label = f"{safe_str(date_label)} Budget Report"
+            balance_candidates = [c for c in df_work_full.columns if str(c).startswith("Budget Balance")]
+            if not balance_candidates:
+                raise KeyError("PPM document is missing a column starting with 'Budget Balance'.")
+            balance_col = balance_candidates[0]
 
-        hide_indirect_effective = hide_indirect_in_output if ("Indirect Rate" in df_out.columns) else True
+            keep_cols = []
+            for c in [
+                PI_COL_NAME,
+                project_col,
+                "Project Name",
+                "Project Manager",
+                task_name_col,
+                task_num_col,
+                "Budget",
+                "expenses",
+                balance_col,
+            ]:
+                if c in df_work_full.columns and c not in keep_cols:
+                    keep_cols.append(c)
 
-        zip_bytes = build_pi_zip(
-            df_out=df_out,
-            pi_col=PI_COL_NAME,
-            hide_indirect=hide_indirect_effective,
-            report_label=report_label,
-        )
+            df_work = df_work_full[keep_cols].copy()
 
-        st.success("ZIP generated!")
-        st.download_button(
-            "Download ZIP (PI files)",
-            data=zip_bytes,
-            file_name=f"{make_safe_filename_fragment(report_label)} - PI Files.zip",
-            mime="application/zip",
-        )
+            p = df_work[project_col].apply(safe_str).str.replace(".0", "", regex=False)
+            t = df_work[task_num_col].apply(safe_str).str.replace(".0", "", regex=False)
+            df_work[project_col] = (p + "-" + t).str.strip("-")
 
-except Exception as e:
-    st.error(f"Error: {e}")
-    if show_trace:
-        st.code(traceback.format_exc())
+            if "Project Name" in df_work.columns:
+                df_work["Project Name"] = df_work["Project Name"].apply(safe_str) + " – " + df_work[task_name_col].apply(safe_str)
+
+            df_work = df_work.drop(columns=[task_name_col, task_num_col], errors="ignore")
+            df_work = df_work.rename(columns={"Budget": "Allocated Budget", balance_col: "Current Balance"})
+
+            if has_award and df_award is not None:
+                df_work["_merge_key"] = df_work_full[master_merge_col].apply(canon_key)
+
+                df_aw = df_award.copy()
+                df_aw["_merge_key"] = df_aw[award_merge_col].apply(canon_key)
+
+                df_aw_sub = df_aw[["_merge_key", award_rate_col]].copy()
+                df_aw_sub = df_aw_sub.drop_duplicates(subset=["_merge_key"], keep="first")
+                df_aw_sub = df_aw_sub.rename(columns={award_rate_col: "Indirect Rate"})
+
+                df_merged = df_work.merge(df_aw_sub, on="_merge_key", how="left").drop(columns=["_merge_key"])
+
+                df_merged["Indirect Rate"] = pd.to_numeric(df_merged["Indirect Rate"], errors="coerce").fillna(0.0)
+                df_merged["Allocated Budget"] = pd.to_numeric(df_merged["Allocated Budget"], errors="coerce")
+                df_merged["Current Balance"] = pd.to_numeric(df_merged["Current Balance"], errors="coerce")
+
+                denom = 1.0 + df_merged["Indirect Rate"]
+                df_merged[ALLOC_BUDGET_NET_COL] = df_merged["Allocated Budget"] / denom
+                df_merged[CURRENT_BAL_NET_COL] = df_merged["Current Balance"] / denom
+
+                df_out = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
+            else:
+                df_work["Allocated Budget"] = pd.to_numeric(df_work["Allocated Budget"], errors="coerce")
+                df_work["Current Balance"] = pd.to_numeric(df_work["Current Balance"], errors="coerce")
+                df_work[ALLOC_BUDGET_NET_COL] = df_work["Allocated Budget"]
+                df_work[CURRENT_BAL_NET_COL] = df_work["Current Balance"]
+                df_out = df_work.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
+
+            if safe_str(date_label):
+                df_out["Date Pulled"] = safe_str(date_label)
+
+            if PI_COL_NAME not in df_out.columns:
+                raise KeyError(f"PI column '{PI_COL_NAME}' not found in PPM. Columns: {list(df_out.columns)}")
+            df_out[PI_COL_NAME] = df_out[PI_COL_NAME].apply(normalize_pi_last_first)
+
+            desired = [
+                PI_COL_NAME,
+                "Project Manager",
+                "Date Pulled",
+                project_col,
+                "Project Name",
+                ALLOC_BUDGET_NET_COL,
+                CURRENT_BAL_NET_COL,
+                "Indirect Rate",
+                "expenses",
+            ]
+            desired = [c for c in desired if c in df_out.columns]
+            remaining = [c for c in df_out.columns if c not in desired]
+            df_out = df_out[desired + remaining]
+
+            report_label = "Budget Report"
+            if safe_str(date_label):
+                report_label = f"{safe_str(date_label)} Budget Report"
+
+            hide_indirect_effective = hide_indirect_in_output if ("Indirect Rate" in df_out.columns) else True
+
+            zip_bytes = build_pi_zip(
+                df_out=df_out,
+                pi_col=PI_COL_NAME,
+                hide_indirect=hide_indirect_effective,
+                report_label=report_label,
+            )
+
+            st.success("ZIP generated!")
+            st.download_button(
+                "Download ZIP (PI files)",
+                data=zip_bytes,
+                file_name=f"{make_safe_filename_fragment(report_label)} - PI Files.zip",
+                mime="application/zip",
+            )
+
+    except Exception as e:
+        st.error(f"Error: {e}")
+        if show_trace:
+            st.code(traceback.format_exc())
+else:
+    st.info("Choose PPM or GL, then upload the corresponding database file. (Award Info is only available in PPM mode.)")
