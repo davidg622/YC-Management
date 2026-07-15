@@ -513,92 +513,73 @@ def organize_391(df: pd.DataFrame) -> pd.DataFrame:
         na_position="last",
     ).reset_index(drop=True)
 
-    df_out = relocate_blank_pi_duplicates(df_out)
-
     return df_out
 
 
-def relocate_blank_pi_duplicates(df_out: pd.DataFrame) -> pd.DataFrame:
-    """
-    Within each Department, if the same Employee Name appears more than once and at least
-    one of those rows has a filled PI while another has a blank PI, move the blank-PI row(s)
-    to sit directly under the (first) filled-PI row for that employee. Rows are never moved
-    across departments/tabs. All other ordering is left untouched.
-    """
-    emp_col = R391_COL_EMP_NAME
+def _sanitize_sheet_name(name: str, used_names: set) -> str:
+    """Excel sheet names: no \\/*?:[] , max 31 chars, must be unique within the workbook."""
+    base = safe_str(name) or "Sheet"
+    for ch in ["\\", "/", "*", "?", ":", "[", "]"]:
+        base = base.replace(ch, "")
+    base = base[:31] if base else "Sheet"
 
-    result_frames = []
-    for dept, dept_df in df_out.groupby("Department", sort=False):
-        dept_df = dept_df.reset_index(drop=True)
-        pi_blank = dept_df["PI"].apply(safe_str).eq("")
+    candidate = base
+    k = 2
+    while candidate in used_names:
+        suffix = f"_{k}"
+        candidate = f"{base[: 31 - len(suffix)]}{suffix}"
+        k += 1
+    used_names.add(candidate)
+    return candidate
 
-        emp_counts = dept_df[emp_col].value_counts()
-        dup_emps = emp_counts[emp_counts > 1].index
 
-        anchor_for_emp = {}
-        blanks_for_emp = {}
-        move_mask = pd.Series(False, index=dept_df.index)
+def _style_391_sheet(ws, date_cols, currency_cols):
+    _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=11)
 
-        for emp in dup_emps:
-            emp_positions = dept_df.index[dept_df[emp_col] == emp]
-            has_filled = (~pi_blank.loc[emp_positions]).any()
-            has_blank = pi_blank.loc[emp_positions].any()
-            if has_filled and has_blank:
-                filled_positions = [p for p in emp_positions if not pi_blank.loc[p]]
-                blank_positions = [p for p in emp_positions if pi_blank.loc[p]]
-                anchor_for_emp[emp] = filled_positions[0]
-                blanks_for_emp[emp] = blank_positions
-                for p in blank_positions:
-                    move_mask.loc[p] = True
+    headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    col_map = {h: idx + 1 for idx, h in enumerate(headers)}
+    for h in date_cols:
+        if h in col_map:
+            col_letter = get_column_letter(col_map[h])
+            for cell in ws[col_letter]:
+                if cell.row <= 1:
+                    continue
+                cell.number_format = "MM/DD/YYYY"
 
-        new_rows = []
-        for pos in dept_df.index:
-            if move_mask.loc[pos]:
+    if R391_COL_FTE in col_map:
+        fte_letter = get_column_letter(col_map[R391_COL_FTE])
+        for cell in ws[fte_letter]:
+            if cell.row <= 1:
                 continue
-            new_rows.append(dept_df.loc[pos])
-            for emp, anchor_pos in anchor_for_emp.items():
-                if anchor_pos == pos:
-                    for blank_pos in blanks_for_emp[emp]:
-                        new_rows.append(dept_df.loc[blank_pos])
+            cell.number_format = "0.00"
 
-        result_frames.append(pd.DataFrame(new_rows))
+    # Freeze the header row and the first four columns (Department, PI, Employee ID, Employee Name)
+    ws.freeze_panes = "E2"
 
-    return pd.concat(result_frames, ignore_index=True) if result_frames else df_out
+    _auto_width(ws)
 
 
 def build_391_excel(df_out: pd.DataFrame) -> bytes:
     date_cols = [R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED]
     currency_cols = [R391_COL_MONTHLY_RATE]
 
+    departments = sorted(d for d in df_out["Department"].apply(safe_str).unique().tolist() if d)
+
     xbuf = BytesIO()
     with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
-        df_out.to_excel(writer, index=False, sheet_name="391 Organized")
-        wb = writer.book
-        ws = wb["391 Organized"]
+        used_names = set()
 
-        _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=11)
-
-        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        col_map = {h: idx + 1 for idx, h in enumerate(headers)}
-        for h in date_cols:
-            if h in col_map:
-                col_letter = get_column_letter(col_map[h])
-                for cell in ws[col_letter]:
-                    if cell.row <= 1:
-                        continue
-                    cell.number_format = "MM/DD/YYYY"
-
-        if R391_COL_FTE in col_map:
-            fte_letter = get_column_letter(col_map[R391_COL_FTE])
-            for cell in ws[fte_letter]:
-                if cell.row <= 1:
-                    continue
-                cell.number_format = "0.00"
-
-        # Freeze the header row and the first four columns (Department, PI, Employee ID, Employee Name)
-        ws.freeze_panes = "E2"
-
-        _auto_width(ws)
+        if not departments:
+            # Fallback: no department values at all, still produce a valid workbook
+            sheet_name = _sanitize_sheet_name("391 Organized", used_names)
+            df_out.to_excel(writer, index=False, sheet_name=sheet_name)
+            _style_391_sheet(writer.book[sheet_name], date_cols, currency_cols)
+        else:
+            for dept in departments:
+                dept_df = df_out[df_out["Department"] == dept].copy()
+                sheet_name = _sanitize_sheet_name(dept, used_names)
+                dept_df.to_excel(writer, index=False, sheet_name=sheet_name)
+                _style_391_sheet(writer.book[sheet_name], date_cols, currency_cols)
 
     xbuf.seek(0)
     return xbuf.getvalue()
