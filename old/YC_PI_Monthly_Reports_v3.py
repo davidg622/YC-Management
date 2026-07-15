@@ -99,7 +99,6 @@ R391_COL_DATE_ADDED = "Date Added"                              # AV
 R391_COL_MONTHLY_RATE = "Monthly Rate"                          # AB
 R391_COL_OTC_INDC = "OTC Indc"                                  # AS
 R391_COL_DIST_PCT = "Dist Pct"                                  # AU
-R391_COL_FTE = "FTE"                                            # Y
 R391_COL_FIN_DEPT = "Financial Department"                      # AH
 R391_COL_PROJECT = "Project"                                    # AM
 R391_COL_TASK = "Task"                                          # AO
@@ -117,7 +116,6 @@ R391_OUTPUT_COLUMNS = [
     R391_COL_MONTHLY_RATE,
     R391_COL_OTC_INDC,
     R391_COL_DIST_PCT,
-    R391_COL_FTE,
     R391_COL_FIN_DEPT,
     R391_COL_PROJECT,
     R391_COL_TASK,
@@ -386,38 +384,6 @@ def read_gl_with_auto_header(db_bytes: bytes, sheet_name: str, required_cols: li
 # -----------------------------
 # 391 (Funding Entry Report) reader + organizer
 # -----------------------------
-def normalize_name_key(s) -> str:
-    """Lowercase, letters-and-spaces-only key for loose name matching."""
-    s = safe_str(s)
-    s = re.sub(r"[^A-Za-z\s]", "", s)
-    s = re.sub(r"\s+", " ", s).strip().lower()
-    return s
-
-
-def match_employee_to_pi(emp_name: str, pi_lookup: dict):
-    """
-    Employee names are formatted "Last,First Middle"; PI names are formatted "First Last".
-    Try (a) full "First Middle Last" and (b) "First Last" (dropping any middle name/initial)
-    against the known-PI lookup. Returns the matched PI's original display string, or None.
-    """
-    s = safe_str(emp_name)
-    if not s or "," not in s:
-        return None
-    last_part, first_part = s.split(",", 1)
-    last_part = last_part.strip()
-    first_part = first_part.strip()
-    tokens = first_part.split()
-    if not tokens:
-        return None
-
-    candidates = [f"{first_part} {last_part}", f"{tokens[0]} {last_part}"]
-    for cand in candidates:
-        key = normalize_name_key(cand)
-        if key in pi_lookup:
-            return pi_lookup[key]
-    return None
-
-
 def read_391(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=0)
     df.columns = normalize_columns(df.columns)
@@ -430,29 +396,18 @@ def organize_391(df: pd.DataFrame) -> pd.DataFrame:
       - "Financial Department Description" -> "Department" (first 3 letters only), placed first
       - "Project Principal Investigator" -> "PI", second
       - Drop rows with a blank Employee ID or Employee Name
-      - Where PI is blank, try to match the Employee Name (format "Last, First") against the
-        set of known PI names (format "First Last") in this file; if matched, fill PI with it
       - Keep a fixed set of columns in a fixed order (see R391_OUTPUT_COLUMNS)
       - Sort by Department, then PI
     """
     required = [
         R391_COL_FIN_DEPT_DESC, R391_COL_PI, R391_COL_EMP_ID, R391_COL_EMP_NAME,
         R391_COL_JOB_DESC, R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED,
-        R391_COL_MONTHLY_RATE, R391_COL_OTC_INDC, R391_COL_DIST_PCT, R391_COL_FTE,
-        R391_COL_FIN_DEPT, R391_COL_PROJECT, R391_COL_TASK, R391_COL_AWARD,
+        R391_COL_MONTHLY_RATE, R391_COL_OTC_INDC, R391_COL_DIST_PCT, R391_COL_FIN_DEPT,
+        R391_COL_PROJECT, R391_COL_TASK, R391_COL_AWARD,
     ]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise KeyError(f"391 file is missing expected column(s): {missing}. Columns found: {list(df.columns)}")
-
-    # Build a lookup of known PI names (as they appear in this file) before any filtering,
-    # so employee-name matching has the widest possible pool of PIs to match against.
-    known_pis = [p for p in df[R391_COL_PI].apply(safe_str).unique() if p]
-    pi_lookup = {}
-    for pi in known_pis:
-        key = normalize_name_key(pi)
-        if key and key not in pi_lookup:
-            pi_lookup[key] = pi
 
     work = df.copy()
 
@@ -462,12 +417,7 @@ def organize_391(df: pd.DataFrame) -> pd.DataFrame:
     work = work[has_emp_id & has_emp_name].copy()
 
     work["Department"] = work[R391_COL_FIN_DEPT_DESC].apply(safe_str).str[:3]
-
-    pi_series = work[R391_COL_PI].apply(safe_str)
-    blank_pi_mask = pi_series.eq("")
-    matched_pi = work.loc[blank_pi_mask, R391_COL_EMP_NAME].apply(lambda nm: match_employee_to_pi(nm, pi_lookup))
-    pi_series.loc[blank_pi_mask] = matched_pi.fillna("")
-    work["PI"] = pi_series
+    work["PI"] = work[R391_COL_PI]
 
     df_out = work[R391_OUTPUT_COLUMNS].copy()
     df_out = df_out.sort_values(
@@ -500,13 +450,6 @@ def build_391_excel(df_out: pd.DataFrame) -> bytes:
                     if cell.row <= 1:
                         continue
                     cell.number_format = "MM/DD/YYYY"
-
-        if R391_COL_FTE in col_map:
-            fte_letter = get_column_letter(col_map[R391_COL_FTE])
-            for cell in ws[fte_letter]:
-                if cell.row <= 1:
-                    continue
-                cell.number_format = "0.00"
 
         _auto_width(ws)
 
@@ -765,19 +708,10 @@ try:
 
         rows_dropped = len(df_391_raw) - len(df_391_out)
 
-        _work_check = df_391_raw.copy()
-        _has_id = _work_check[R391_COL_EMP_ID].apply(safe_str).ne("")
-        _has_name = _work_check[R391_COL_EMP_NAME].apply(safe_str).ne("")
-        _work_check = _work_check[_has_id & _has_name]
-        blank_pi_before = int(_work_check[R391_COL_PI].apply(safe_str).eq("").sum())
-        blank_pi_after = int(df_391_out["PI"].apply(safe_str).eq("").sum())
-        pi_filled = blank_pi_before - blank_pi_after
-
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3 = st.columns(3)
         m1.metric("Funding rows (organized)", len(df_391_out))
         m2.metric("Rows dropped (no employee)", rows_dropped)
-        m3.metric("PI filled via name match", pi_filled)
-        m4.metric("Departments", df_391_out["Department"].nunique())
+        m3.metric("Departments", df_391_out["Department"].nunique())
 
         st.dataframe(df_391_out, use_container_width=True, height=480)
 
