@@ -85,6 +85,43 @@ GL_COL_DESC = "Description"
 COLOR_POSITIVE_GREEN = "004B00"   # dark green text
 COLOR_NEGATIVE_RED   = "8B0000"   # dark red text
 
+# 391 (Funding Entry Report) source columns
+R391_COL_FIN_DEPT_DESC = "Financial Department Description"  # AI -> renamed "Department" (first 3 letters)
+R391_COL_PI = "Project Principal Investigator"                # AQ -> renamed "PI"
+R391_COL_EMP_ID = "Employee ID"                                # J
+R391_COL_EMP_NAME = "Employee Name"                            # K (note: user referenced "E", but "Employee Name"
+                                                                # actually lives in column K in this export; E is
+                                                                # "Sub Division Description". Matched by column name.)
+R391_COL_JOB_DESC = "Job Code Description"                     # N
+R391_COL_EFF_DATE = "Effective Date"                           # U
+R391_COL_EXP_END_DATE = "Expected End Date"                     # X
+R391_COL_DATE_ADDED = "Date Added"                              # AV
+R391_COL_MONTHLY_RATE = "Monthly Rate"                          # AB
+R391_COL_OTC_INDC = "OTC Indc"                                  # AS
+R391_COL_DIST_PCT = "Dist Pct"                                  # AU
+R391_COL_FIN_DEPT = "Financial Department"                      # AH
+R391_COL_PROJECT = "Project"                                    # AM
+R391_COL_TASK = "Task"                                          # AO
+R391_COL_AWARD = "Award"                                        # AP
+
+R391_OUTPUT_COLUMNS = [
+    "Department",
+    "PI",
+    R391_COL_EMP_ID,
+    R391_COL_EMP_NAME,
+    R391_COL_JOB_DESC,
+    R391_COL_EFF_DATE,
+    R391_COL_EXP_END_DATE,
+    R391_COL_DATE_ADDED,
+    R391_COL_MONTHLY_RATE,
+    R391_COL_OTC_INDC,
+    R391_COL_DIST_PCT,
+    R391_COL_FIN_DEPT,
+    R391_COL_PROJECT,
+    R391_COL_TASK,
+    R391_COL_AWARD,
+]
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -345,6 +382,82 @@ def read_gl_with_auto_header(db_bytes: bytes, sheet_name: str, required_cols: li
 
 
 # -----------------------------
+# 391 (Funding Entry Report) reader + organizer
+# -----------------------------
+def read_391(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
+    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=0)
+    df.columns = normalize_columns(df.columns)
+    return df
+
+
+def organize_391(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Reorganize a raw 391 export into a clean, human-readable table:
+      - "Financial Department Description" -> "Department" (first 3 letters only), placed first
+      - "Project Principal Investigator" -> "PI", second
+      - Drop rows with a blank Employee ID or Employee Name
+      - Keep a fixed set of columns in a fixed order (see R391_OUTPUT_COLUMNS)
+      - Sort by Department, then PI
+    """
+    required = [
+        R391_COL_FIN_DEPT_DESC, R391_COL_PI, R391_COL_EMP_ID, R391_COL_EMP_NAME,
+        R391_COL_JOB_DESC, R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED,
+        R391_COL_MONTHLY_RATE, R391_COL_OTC_INDC, R391_COL_DIST_PCT, R391_COL_FIN_DEPT,
+        R391_COL_PROJECT, R391_COL_TASK, R391_COL_AWARD,
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"391 file is missing expected column(s): {missing}. Columns found: {list(df.columns)}")
+
+    work = df.copy()
+
+    # Remove rows with no employee attached to the funding line
+    has_emp_id = work[R391_COL_EMP_ID].apply(safe_str).ne("")
+    has_emp_name = work[R391_COL_EMP_NAME].apply(safe_str).ne("")
+    work = work[has_emp_id & has_emp_name].copy()
+
+    work["Department"] = work[R391_COL_FIN_DEPT_DESC].apply(safe_str).str[:3]
+    work["PI"] = work[R391_COL_PI]
+
+    df_out = work[R391_OUTPUT_COLUMNS].copy()
+    df_out = df_out.sort_values(
+        by=["Department", "PI"],
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
+
+    return df_out
+
+
+def build_391_excel(df_out: pd.DataFrame) -> bytes:
+    date_cols = [R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED]
+    currency_cols = [R391_COL_MONTHLY_RATE]
+
+    xbuf = BytesIO()
+    with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
+        df_out.to_excel(writer, index=False, sheet_name="391 Organized")
+        wb = writer.book
+        ws = wb["391 Organized"]
+
+        _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=11)
+
+        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        col_map = {h: idx + 1 for idx, h in enumerate(headers)}
+        for h in date_cols:
+            if h in col_map:
+                col_letter = get_column_letter(col_map[h])
+                for cell in ws[col_letter]:
+                    if cell.row <= 1:
+                        continue
+                    cell.number_format = "MM/DD/YYYY"
+
+        _auto_width(ws)
+
+    xbuf.seek(0)
+    return xbuf.getvalue()
+
+
+# -----------------------------
 # PPM output builder (ZIP per PI)
 # -----------------------------
 def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_label: str) -> bytes:
@@ -544,6 +657,7 @@ st.markdown(
 
 PPM_OPTION = "PPM (Monthly Budget)"
 GL_OPTION = "GL (YTD Expense Table)"
+R391_OPTION = "391 (Funding Entry Report)"
 
 # -----------------------------
 # Sidebar: setup / inputs
@@ -552,14 +666,16 @@ with st.sidebar:
     st.markdown("#### Setup")
     db_type = st.radio(
         "Database type",
-        options=[PPM_OPTION, GL_OPTION],
+        options=[PPM_OPTION, GL_OPTION, R391_OPTION],
         index=0,
-        help="PPM = Aggie Enterprise (PPM export). GL = General Ledger export.",
+        help="PPM = Aggie Enterprise (PPM export). GL = General Ledger export. 391 = UCPath Funding Entry Report.",
     )
-    db_file = st.file_uploader(
-        "PPM database (.xlsx)" if db_type == PPM_OPTION else "GL database (.xlsx)",
-        type=["xlsx"],
-    )
+    uploader_labels = {
+        PPM_OPTION: "PPM database (.xlsx)",
+        GL_OPTION: "GL database (.xlsx)",
+        R391_OPTION: "391 database (.xlsx)",
+    }
+    db_file = st.file_uploader(uploader_labels[db_type], type=["xlsx"])
 
     award_file = None
     hide_indirect_in_output = True
@@ -570,13 +686,48 @@ with st.sidebar:
 
 if not db_file:
     st.info(
-        "Choose PPM or GL in the sidebar, then upload the corresponding database file. "
+        "Choose PPM, GL, or 391 in the sidebar, then upload the corresponding database file. "
         "Award Info is only available in PPM mode."
     )
     st.stop()
 
 try:
     db_bytes = db_file.getvalue()
+
+    # ============================================================
+    # 391 MODE
+    # ============================================================
+    if db_type == R391_OPTION:
+        xl_391 = pd.ExcelFile(BytesIO(db_bytes))
+        sheet_391 = xl_391.sheet_names[0]
+        if len(xl_391.sheet_names) > 1:
+            sheet_391 = st.selectbox("391 sheet to use", options=xl_391.sheet_names, index=0)
+
+        df_391_raw = read_391(db_bytes, sheet_name=sheet_391)
+        df_391_out = organize_391(df_391_raw)
+
+        rows_dropped = len(df_391_raw) - len(df_391_out)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Funding rows (organized)", len(df_391_out))
+        m2.metric("Rows dropped (no employee)", rows_dropped)
+        m3.metric("Departments", df_391_out["Department"].nunique())
+
+        st.dataframe(df_391_out, use_container_width=True, height=480)
+
+        report_label_391 = st.text_input("Report label (used in filename)", value="391 Funding Entry - Organized")
+
+        if st.button("Generate Organized 391 Excel", type="primary", use_container_width=True):
+            xlsx_391_bytes = build_391_excel(df_391_out)
+            st.success("391 Excel generated!")
+            st.download_button(
+                "Download Organized 391",
+                data=xlsx_391_bytes,
+                file_name=f"{make_safe_filename_fragment(report_label_391)}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        st.stop()
 
     # ============================================================
     # GL MODE
