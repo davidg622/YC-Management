@@ -1,5 +1,6 @@
 import re
 import traceback
+from datetime import date
 from io import BytesIO
 import zipfile
 
@@ -123,6 +124,12 @@ R391_OUTPUT_COLUMNS = [
     R391_COL_TASK,
     R391_COL_AWARD,
 ]
+
+# Job Code Description in this set -> the employee is PI of their own funding
+R391_SELF_PI_JOB_CODES = {"PROF-AY", "ADJ PROF-AY", "ASST PROF-AY"}
+
+# Job Code Descriptions to drop entirely from the 391 output
+R391_EXCLUDED_JOB_CODES = {"FINANCIAL ANL SUPV 1", "RSCH ADM 3 RP"}
 
 # -----------------------------
 # Helpers
@@ -418,6 +425,19 @@ def match_employee_to_pi(emp_name: str, pi_lookup: dict):
     return None
 
 
+def format_employee_as_first_last(emp_name: str) -> str:
+    """Convert 'Last,First Middle' -> 'First Last' (drops any middle name/initial)."""
+    s = safe_str(emp_name)
+    if not s or "," not in s:
+        return s
+    last_part, first_part = s.split(",", 1)
+    last_part = last_part.strip()
+    first_part = first_part.strip()
+    tokens = first_part.split()
+    first_token = tokens[0] if tokens else first_part
+    return f"{first_token} {last_part}".strip()
+
+
 def read_391(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
     df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=0)
     df.columns = normalize_columns(df.columns)
@@ -430,8 +450,12 @@ def organize_391(df: pd.DataFrame) -> pd.DataFrame:
       - "Financial Department Description" -> "Department" (first 3 letters only), placed first
       - "Project Principal Investigator" -> "PI", second
       - Drop rows with a blank Employee ID or Employee Name
+      - Drop rows whose Job Code Description is in R391_EXCLUDED_JOB_CODES
       - Where PI is blank, try to match the Employee Name (format "Last, First") against the
         set of known PI names (format "First Last") in this file; if matched, fill PI with it
+      - Where Job Code Description is in R391_SELF_PI_JOB_CODES ("PROF-AY", "ADJ PROF-AY",
+        "ASST PROF-AY"), the employee is PI of their own funding, so PI is forced to their own
+        name (reformatted "First Last"), overriding whatever the matching step produced
       - Keep a fixed set of columns in a fixed order (see R391_OUTPUT_COLUMNS)
       - Sort by Department, then PI
     """
@@ -461,12 +485,25 @@ def organize_391(df: pd.DataFrame) -> pd.DataFrame:
     has_emp_name = work[R391_COL_EMP_NAME].apply(safe_str).ne("")
     work = work[has_emp_id & has_emp_name].copy()
 
+    # Remove rows whose Job Code Description is explicitly excluded
+    job_desc_series = work[R391_COL_JOB_DESC].apply(safe_str)
+    excluded_upper = {c.upper() for c in R391_EXCLUDED_JOB_CODES}
+    work = work[~job_desc_series.str.upper().isin(excluded_upper)].copy()
+
     work["Department"] = work[R391_COL_FIN_DEPT_DESC].apply(safe_str).str[:3]
 
     pi_series = work[R391_COL_PI].apply(safe_str)
     blank_pi_mask = pi_series.eq("")
     matched_pi = work.loc[blank_pi_mask, R391_COL_EMP_NAME].apply(lambda nm: match_employee_to_pi(nm, pi_lookup))
     pi_series.loc[blank_pi_mask] = matched_pi.fillna("")
+
+    # PROF-AY employees (and the ADJ/ASST variants) are PI of their own funding,
+    # regardless of what matching produced
+    job_desc_series = work[R391_COL_JOB_DESC].apply(safe_str)
+    self_pi_codes_upper = {c.upper() for c in R391_SELF_PI_JOB_CODES}
+    self_pi_mask = job_desc_series.str.upper().isin(self_pi_codes_upper)
+    pi_series.loc[self_pi_mask] = work.loc[self_pi_mask, R391_COL_EMP_NAME].apply(format_employee_as_first_last)
+
     work["PI"] = pi_series
 
     df_out = work[R391_OUTPUT_COLUMNS].copy()
@@ -479,36 +516,70 @@ def organize_391(df: pd.DataFrame) -> pd.DataFrame:
     return df_out
 
 
+def _sanitize_sheet_name(name: str, used_names: set) -> str:
+    """Excel sheet names: no \\/*?:[] , max 31 chars, must be unique within the workbook."""
+    base = safe_str(name) or "Sheet"
+    for ch in ["\\", "/", "*", "?", ":", "[", "]"]:
+        base = base.replace(ch, "")
+    base = base[:31] if base else "Sheet"
+
+    candidate = base
+    k = 2
+    while candidate in used_names:
+        suffix = f"_{k}"
+        candidate = f"{base[: 31 - len(suffix)]}{suffix}"
+        k += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def _style_391_sheet(ws, date_cols, currency_cols):
+    _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=11)
+
+    headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    col_map = {h: idx + 1 for idx, h in enumerate(headers)}
+    for h in date_cols:
+        if h in col_map:
+            col_letter = get_column_letter(col_map[h])
+            for cell in ws[col_letter]:
+                if cell.row <= 1:
+                    continue
+                cell.number_format = "MM/DD/YYYY"
+
+    if R391_COL_FTE in col_map:
+        fte_letter = get_column_letter(col_map[R391_COL_FTE])
+        for cell in ws[fte_letter]:
+            if cell.row <= 1:
+                continue
+            cell.number_format = "0.00"
+
+    # Freeze the header row and the first four columns (Department, PI, Employee ID, Employee Name)
+    ws.freeze_panes = "E2"
+
+    _auto_width(ws)
+
+
 def build_391_excel(df_out: pd.DataFrame) -> bytes:
     date_cols = [R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED]
     currency_cols = [R391_COL_MONTHLY_RATE]
 
+    departments = sorted(d for d in df_out["Department"].apply(safe_str).unique().tolist() if d)
+
     xbuf = BytesIO()
     with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
-        df_out.to_excel(writer, index=False, sheet_name="391 Organized")
-        wb = writer.book
-        ws = wb["391 Organized"]
+        used_names = set()
 
-        _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=11)
-
-        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        col_map = {h: idx + 1 for idx, h in enumerate(headers)}
-        for h in date_cols:
-            if h in col_map:
-                col_letter = get_column_letter(col_map[h])
-                for cell in ws[col_letter]:
-                    if cell.row <= 1:
-                        continue
-                    cell.number_format = "MM/DD/YYYY"
-
-        if R391_COL_FTE in col_map:
-            fte_letter = get_column_letter(col_map[R391_COL_FTE])
-            for cell in ws[fte_letter]:
-                if cell.row <= 1:
-                    continue
-                cell.number_format = "0.00"
-
-        _auto_width(ws)
+        if not departments:
+            # Fallback: no department values at all, still produce a valid workbook
+            sheet_name = _sanitize_sheet_name("391 Organized", used_names)
+            df_out.to_excel(writer, index=False, sheet_name=sheet_name)
+            _style_391_sheet(writer.book[sheet_name], date_cols, currency_cols)
+        else:
+            for dept in departments:
+                dept_df = df_out[df_out["Department"] == dept].copy()
+                sheet_name = _sanitize_sheet_name(dept, used_names)
+                dept_df.to_excel(writer, index=False, sheet_name=sheet_name)
+                _style_391_sheet(writer.book[sheet_name], date_cols, currency_cols)
 
     xbuf.seek(0)
     return xbuf.getvalue()
@@ -763,25 +834,34 @@ try:
         df_391_raw = read_391(db_bytes, sheet_name=sheet_391)
         df_391_out = organize_391(df_391_raw)
 
-        rows_dropped = len(df_391_raw) - len(df_391_out)
-
         _work_check = df_391_raw.copy()
         _has_id = _work_check[R391_COL_EMP_ID].apply(safe_str).ne("")
         _has_name = _work_check[R391_COL_EMP_NAME].apply(safe_str).ne("")
+        _rows_no_employee = int((~(_has_id & _has_name)).sum())
         _work_check = _work_check[_has_id & _has_name]
+
+        _job_desc = _work_check[R391_COL_JOB_DESC].apply(safe_str)
+        _excluded_upper = {c.upper() for c in R391_EXCLUDED_JOB_CODES}
+        _rows_excluded_job_code = int(_job_desc.str.upper().isin(_excluded_upper).sum())
+        _work_check = _work_check[~_job_desc.str.upper().isin(_excluded_upper)]
+
         blank_pi_before = int(_work_check[R391_COL_PI].apply(safe_str).eq("").sum())
         blank_pi_after = int(df_391_out["PI"].apply(safe_str).eq("").sum())
         pi_filled = blank_pi_before - blank_pi_after
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Funding rows (organized)", len(df_391_out))
-        m2.metric("Rows dropped (no employee)", rows_dropped)
-        m3.metric("PI filled via name match", pi_filled)
-        m4.metric("Departments", df_391_out["Department"].nunique())
+        m2.metric("Dropped (no employee)", _rows_no_employee)
+        m3.metric("Dropped (excluded job code)", _rows_excluded_job_code)
+        m4.metric("PI filled/self-assigned", pi_filled)
+        m5.metric("Departments", df_391_out["Department"].nunique())
 
         st.dataframe(df_391_out, use_container_width=True, height=480)
 
-        report_label_391 = st.text_input("Report label (used in filename)", value="391 Funding Entry - Organized")
+        report_label_391 = st.text_input(
+            "Report label (used in filename)",
+            value=f"391_Filtered_{date.today().strftime('%Y-%m-%d')}",
+        )
 
         if st.button("Generate Organized 391 Excel", type="primary", use_container_width=True):
             xlsx_391_bytes = build_391_excel(df_391_out)
