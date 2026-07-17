@@ -87,8 +87,8 @@ COLOR_POSITIVE_GREEN = "004B00"   # dark green text
 COLOR_NEGATIVE_RED   = "8B0000"   # dark red text
 
 # 391 (Funding Entry Report) source columns
-R391_COL_FIN_DEPT_DESC = "Financial Department Description"  # AI -> "Department" (first 3 letters), no longer sorted/first
-R391_COL_PI = "Project Principal Investigator"                # AQ -> renamed "Principal Investigator", now first column & sort key
+R391_COL_FIN_DEPT_DESC = "Financial Department Description"  # AI -> renamed "Department" (first 3 letters)
+R391_COL_PI = "Project Principal Investigator"                # AQ -> renamed "PI"
 R391_COL_EMP_ID = "Employee ID"                                # J
 R391_COL_EMP_NAME = "Employee Name"                            # K (note: user referenced "E", but "Employee Name"
                                                                 # actually lives in column K in this export; E is
@@ -98,7 +98,6 @@ R391_COL_EFF_DATE = "Effective Date"                           # U
 R391_COL_EXP_END_DATE = "Expected End Date"                     # X
 R391_COL_DATE_ADDED = "Date Added"                              # AV
 R391_COL_MONTHLY_RATE = "Monthly Rate"                          # AB
-R391_COL_HOURLY_RATE = "Hourly Rate"                            # AA
 R391_COL_OTC_INDC = "OTC Indc"                                  # AS
 R391_COL_DIST_PCT = "Dist Pct"                                  # AU
 R391_COL_FTE = "FTE"                                            # Y
@@ -107,10 +106,9 @@ R391_COL_PROJECT = "Project"                                    # AM
 R391_COL_TASK = "Task"                                          # AO
 R391_COL_AWARD = "Award"                                        # AP
 
-R391_COL_PI_OUTPUT = "Principal Investigator"
-
 R391_OUTPUT_COLUMNS = [
-    R391_COL_PI_OUTPUT,
+    "Department",
+    "PI",
     R391_COL_EMP_ID,
     R391_COL_EMP_NAME,
     R391_COL_JOB_DESC,
@@ -118,11 +116,9 @@ R391_OUTPUT_COLUMNS = [
     R391_COL_EXP_END_DATE,
     R391_COL_DATE_ADDED,
     R391_COL_MONTHLY_RATE,
-    R391_COL_HOURLY_RATE,
     R391_COL_OTC_INDC,
     R391_COL_DIST_PCT,
     R391_COL_FTE,
-    "Department",
     R391_COL_FIN_DEPT,
     R391_COL_PROJECT,
     R391_COL_TASK,
@@ -451,9 +447,8 @@ def read_391(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
 def organize_391(df: pd.DataFrame) -> pd.DataFrame:
     """
     Reorganize a raw 391 export into a clean, human-readable table:
-      - "Project Principal Investigator" -> "Principal Investigator", first column & sort key
-      - "Financial Department Description" -> "Department" (first 3 letters only); retained in
-        the sheet but no longer first and no longer part of the sort
+      - "Financial Department Description" -> "Department" (first 3 letters only), placed first
+      - "Project Principal Investigator" -> "PI", second
       - Drop rows with a blank Employee ID or Employee Name
       - Drop rows whose Job Code Description is in R391_EXCLUDED_JOB_CODES
       - Where PI is blank, try to match the Employee Name (format "Last, First") against the
@@ -462,13 +457,13 @@ def organize_391(df: pd.DataFrame) -> pd.DataFrame:
         "ASST PROF-AY"), the employee is PI of their own funding, so PI is forced to their own
         name (reformatted "First Last"), overriding whatever the matching step produced
       - Keep a fixed set of columns in a fixed order (see R391_OUTPUT_COLUMNS)
-      - Sort by Principal Investigator
+      - Sort by Department, then PI
     """
     required = [
         R391_COL_FIN_DEPT_DESC, R391_COL_PI, R391_COL_EMP_ID, R391_COL_EMP_NAME,
         R391_COL_JOB_DESC, R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED,
-        R391_COL_MONTHLY_RATE, R391_COL_HOURLY_RATE, R391_COL_OTC_INDC, R391_COL_DIST_PCT,
-        R391_COL_FTE, R391_COL_FIN_DEPT, R391_COL_PROJECT, R391_COL_TASK, R391_COL_AWARD,
+        R391_COL_MONTHLY_RATE, R391_COL_OTC_INDC, R391_COL_DIST_PCT, R391_COL_FTE,
+        R391_COL_FIN_DEPT, R391_COL_PROJECT, R391_COL_TASK, R391_COL_AWARD,
     ]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -509,11 +504,11 @@ def organize_391(df: pd.DataFrame) -> pd.DataFrame:
     self_pi_mask = job_desc_series.str.upper().isin(self_pi_codes_upper)
     pi_series.loc[self_pi_mask] = work.loc[self_pi_mask, R391_COL_EMP_NAME].apply(format_employee_as_first_last)
 
-    work[R391_COL_PI_OUTPUT] = pi_series
+    work["PI"] = pi_series
 
     df_out = work[R391_OUTPUT_COLUMNS].copy()
     df_out = df_out.sort_values(
-        by=[R391_COL_PI_OUTPUT],
+        by=["Department", "PI"],
         kind="stable",
         na_position="last",
     ).reset_index(drop=True)
@@ -525,52 +520,55 @@ def organize_391(df: pd.DataFrame) -> pd.DataFrame:
 
 def relocate_blank_pi_duplicates(df_out: pd.DataFrame) -> pd.DataFrame:
     """
-    If the same Employee Name appears more than once and at least one of those rows has a
-    filled Principal Investigator while another has a blank one, move the blank-PI row(s) to
-    sit directly under the (first) filled-PI row for that employee. All other ordering is
-    left untouched.
+    Within each Department, if the same Employee Name appears more than once and at least
+    one of those rows has a filled PI while another has a blank PI, move the blank-PI row(s)
+    to sit directly under the (first) filled-PI row for that employee. Rows are never moved
+    across departments/tabs. All other ordering is left untouched.
     """
     emp_col = R391_COL_EMP_NAME
-    pi_col = R391_COL_PI_OUTPUT
 
-    work = df_out.reset_index(drop=True)
-    pi_blank = work[pi_col].apply(safe_str).eq("")
+    result_frames = []
+    for dept, dept_df in df_out.groupby("Department", sort=False):
+        dept_df = dept_df.reset_index(drop=True)
+        pi_blank = dept_df["PI"].apply(safe_str).eq("")
 
-    emp_counts = work[emp_col].value_counts()
-    dup_emps = emp_counts[emp_counts > 1].index
+        emp_counts = dept_df[emp_col].value_counts()
+        dup_emps = emp_counts[emp_counts > 1].index
 
-    anchor_for_emp = {}
-    blanks_for_emp = {}
-    move_mask = pd.Series(False, index=work.index)
+        anchor_for_emp = {}
+        blanks_for_emp = {}
+        move_mask = pd.Series(False, index=dept_df.index)
 
-    for emp in dup_emps:
-        emp_positions = work.index[work[emp_col] == emp]
-        has_filled = (~pi_blank.loc[emp_positions]).any()
-        has_blank = pi_blank.loc[emp_positions].any()
-        if has_filled and has_blank:
-            filled_positions = [p for p in emp_positions if not pi_blank.loc[p]]
-            blank_positions = [p for p in emp_positions if pi_blank.loc[p]]
-            anchor_for_emp[emp] = filled_positions[0]
-            blanks_for_emp[emp] = blank_positions
-            for p in blank_positions:
-                move_mask.loc[p] = True
+        for emp in dup_emps:
+            emp_positions = dept_df.index[dept_df[emp_col] == emp]
+            has_filled = (~pi_blank.loc[emp_positions]).any()
+            has_blank = pi_blank.loc[emp_positions].any()
+            if has_filled and has_blank:
+                filled_positions = [p for p in emp_positions if not pi_blank.loc[p]]
+                blank_positions = [p for p in emp_positions if pi_blank.loc[p]]
+                anchor_for_emp[emp] = filled_positions[0]
+                blanks_for_emp[emp] = blank_positions
+                for p in blank_positions:
+                    move_mask.loc[p] = True
 
-    new_rows = []
-    for pos in work.index:
-        if move_mask.loc[pos]:
-            continue
-        new_rows.append(work.loc[pos])
-        for emp, anchor_pos in anchor_for_emp.items():
-            if anchor_pos == pos:
-                for blank_pos in blanks_for_emp[emp]:
-                    new_rows.append(work.loc[blank_pos])
+        new_rows = []
+        for pos in dept_df.index:
+            if move_mask.loc[pos]:
+                continue
+            new_rows.append(dept_df.loc[pos])
+            for emp, anchor_pos in anchor_for_emp.items():
+                if anchor_pos == pos:
+                    for blank_pos in blanks_for_emp[emp]:
+                        new_rows.append(dept_df.loc[blank_pos])
 
-    return pd.DataFrame(new_rows).reset_index(drop=True)
+        result_frames.append(pd.DataFrame(new_rows))
+
+    return pd.concat(result_frames, ignore_index=True) if result_frames else df_out
 
 
 def build_391_excel(df_out: pd.DataFrame) -> bytes:
     date_cols = [R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED]
-    currency_cols = [R391_COL_MONTHLY_RATE, R391_COL_HOURLY_RATE]
+    currency_cols = [R391_COL_MONTHLY_RATE]
 
     xbuf = BytesIO()
     with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
@@ -867,7 +865,7 @@ try:
         _work_check = _work_check[~_job_desc.str.upper().isin(_excluded_upper)]
 
         blank_pi_before = int(_work_check[R391_COL_PI].apply(safe_str).eq("").sum())
-        blank_pi_after = int(df_391_out[R391_COL_PI_OUTPUT].apply(safe_str).eq("").sum())
+        blank_pi_after = int(df_391_out["PI"].apply(safe_str).eq("").sum())
         pi_filled = blank_pi_before - blank_pi_after
 
         m1, m2, m3, m4, m5 = st.columns(5)
