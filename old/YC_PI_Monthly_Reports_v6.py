@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 from openpyxl.styles import Font, PatternFill, numbers
 from openpyxl.utils import get_column_letter
-from openpyxl.formatting.rule import CellIsRule, FormulaRule
+from openpyxl.formatting.rule import CellIsRule
 
 # ============================================================
 # Yellow Cluster: Budget Summary Generator
@@ -99,37 +99,13 @@ R391_COL_EXP_END_DATE = "Expected End Date"                     # X
 R391_COL_DATE_ADDED = "Date Added"                              # AV
 R391_COL_MONTHLY_RATE = "Monthly Rate"                          # AB
 R391_COL_HOURLY_RATE = "Hourly Rate"                            # AA
-R391_COL_ANNUAL_RATE = "Annual Rate"                            # derived: Monthly Rate x 9 (Prof job codes) or x 12
 R391_COL_OTC_INDC = "OTC Indc"                                  # AS
 R391_COL_DIST_PCT = "Dist Pct"                                  # AU
 R391_COL_FTE = "FTE"                                            # Y
-
-# Original raw block, columns AF through AP, kept under their original header names and
-# original left-to-right order, and visually set apart in the output workbook
-R391_COL_ENTITY = "Entity"                                      # AF
-R391_COL_FUND = "Fund"                                          # AG
 R391_COL_FIN_DEPT = "Financial Department"                      # AH
-R391_COL_DEPT_ROLLUP = "Department Rollup"                      # AJ
-R391_COL_PURPOSE = "Purpose"                                    # AK
-R391_COL_PROGRAM = "Program"                                    # AL
 R391_COL_PROJECT = "Project"                                    # AM
-R391_COL_ACTIVITY = "Activity"                                  # AN
 R391_COL_TASK = "Task"                                          # AO
 R391_COL_AWARD = "Award"                                        # AP
-
-R391_RAW_BLOCK_COLUMNS = [
-    R391_COL_ENTITY,
-    R391_COL_FUND,
-    R391_COL_FIN_DEPT,
-    R391_COL_FIN_DEPT_DESC,
-    R391_COL_DEPT_ROLLUP,
-    R391_COL_PURPOSE,
-    R391_COL_PROGRAM,
-    R391_COL_PROJECT,
-    R391_COL_ACTIVITY,
-    R391_COL_TASK,
-    R391_COL_AWARD,
-]
 
 R391_COL_PI_OUTPUT = "Principal Investigator"
 
@@ -139,29 +115,25 @@ R391_OUTPUT_COLUMNS = [
     R391_COL_EMP_NAME,
     R391_COL_JOB_DESC,
     R391_COL_EFF_DATE,
-    R391_COL_DATE_ADDED,      # swapped: Date Added now precedes Expected End Date
     R391_COL_EXP_END_DATE,
-    R391_COL_HOURLY_RATE,     # swapped: Hourly Rate now precedes Monthly Rate
+    R391_COL_DATE_ADDED,
     R391_COL_MONTHLY_RATE,
-    R391_COL_ANNUAL_RATE,     # derived, immediately follows Monthly Rate
+    R391_COL_HOURLY_RATE,
     R391_COL_OTC_INDC,
     R391_COL_DIST_PCT,
     R391_COL_FTE,
     "Department",
-] + R391_RAW_BLOCK_COLUMNS
+    R391_COL_FIN_DEPT,
+    R391_COL_PROJECT,
+    R391_COL_TASK,
+    R391_COL_AWARD,
+]
 
 # Job Code Description in this set -> the employee is PI of their own funding
 R391_SELF_PI_JOB_CODES = {"PROF-AY", "ADJ PROF-AY", "ASST PROF-AY"}
 
 # Job Code Descriptions to drop entirely from the 391 output
 R391_EXCLUDED_JOB_CODES = {"FINANCIAL ANL SUPV 1", "RSCH ADM 3 RP"}
-
-# Red-flag row highlighting rules
-R391_REDFLAG_ACTIVITY_CODES = {"990000", "990001", "990002"}
-R391_REDFLAG_PROJECT_PREFIX = "DKO"
-
-# Yellow cell highlight: Expected End Date within this many months of today (either direction)
-R391_EXPIRING_SOON_MONTHS = 2
 
 # -----------------------------
 # Helpers
@@ -476,20 +448,12 @@ def read_391(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
     return df
 
 
-def remove_duplicate_391_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Identify rows that are 100% identical across every output column and retain only the
-    first occurrence of each. Returns a de-duplicated, index-reset DataFrame.
-    """
-    return df.drop_duplicates(keep="first").reset_index(drop=True)
-
-
-def organize_391(df: pd.DataFrame, sort_by: str = None) -> pd.DataFrame:
+def organize_391(df: pd.DataFrame) -> pd.DataFrame:
     """
     Reorganize a raw 391 export into a clean, human-readable table:
-      - "Project Principal Investigator" -> "Principal Investigator", first column
+      - "Project Principal Investigator" -> "Principal Investigator", first column & sort key
       - "Financial Department Description" -> "Department" (first 3 letters only); retained in
-        the sheet but no longer first
+        the sheet but no longer first and no longer part of the sort
       - Drop rows with a blank Employee ID or Employee Name
       - Drop rows whose Job Code Description is in R391_EXCLUDED_JOB_CODES
       - Where PI is blank, try to match the Employee Name (format "Last, First") against the
@@ -497,24 +461,14 @@ def organize_391(df: pd.DataFrame, sort_by: str = None) -> pd.DataFrame:
       - Where Job Code Description is in R391_SELF_PI_JOB_CODES ("PROF-AY", "ADJ PROF-AY",
         "ASST PROF-AY"), the employee is PI of their own funding, so PI is forced to their own
         name (reformatted "First Last"), overriding whatever the matching step produced
-      - Append the original raw block of columns AF-AP (Entity through Award) unchanged, in
-        their original order (see R391_RAW_BLOCK_COLUMNS)
-      - Remove exact-duplicate rows (100% identical across every output column), keeping
-        the first occurrence
-      - Sort by either Principal Investigator or Employee Name (sort_by parameter)
-      - Where the same Employee Name appears more than once with a mix of filled/blank PI,
-        move the blank-PI row(s) directly under the filled-PI row
+      - Keep a fixed set of columns in a fixed order (see R391_OUTPUT_COLUMNS)
+      - Sort by Principal Investigator
     """
-    sort_by = sort_by or R391_COL_PI_OUTPUT
-    sort_col = R391_COL_PI_OUTPUT if sort_by == R391_COL_PI_OUTPUT else R391_COL_EMP_NAME
-
     required = [
         R391_COL_FIN_DEPT_DESC, R391_COL_PI, R391_COL_EMP_ID, R391_COL_EMP_NAME,
         R391_COL_JOB_DESC, R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED,
         R391_COL_MONTHLY_RATE, R391_COL_HOURLY_RATE, R391_COL_OTC_INDC, R391_COL_DIST_PCT,
-        R391_COL_FTE, R391_COL_ENTITY, R391_COL_FUND, R391_COL_FIN_DEPT, R391_COL_DEPT_ROLLUP,
-        R391_COL_PURPOSE, R391_COL_PROGRAM, R391_COL_PROJECT, R391_COL_ACTIVITY, R391_COL_TASK,
-        R391_COL_AWARD,
+        R391_COL_FTE, R391_COL_FIN_DEPT, R391_COL_PROJECT, R391_COL_TASK, R391_COL_AWARD,
     ]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -557,21 +511,9 @@ def organize_391(df: pd.DataFrame, sort_by: str = None) -> pd.DataFrame:
 
     work[R391_COL_PI_OUTPUT] = pi_series
 
-    # Annual Rate: Monthly Rate x 9 for "Prof" job codes (academic-year appointments),
-    # otherwise Monthly Rate x 12, whenever a Monthly Rate exists
-    monthly_numeric = pd.to_numeric(work[R391_COL_MONTHLY_RATE], errors="coerce")
-    has_monthly = monthly_numeric.notna()
-    is_prof = work[R391_COL_JOB_DESC].apply(safe_str).str.upper().str.contains("PROF", na=False)
-    annual_rate = monthly_numeric * 12
-    annual_rate = annual_rate.mask(is_prof, monthly_numeric * 9)
-    annual_rate = annual_rate.where(has_monthly)
-    work[R391_COL_ANNUAL_RATE] = annual_rate
-
     df_out = work[R391_OUTPUT_COLUMNS].copy()
-    df_out = remove_duplicate_391_rows(df_out)
-
     df_out = df_out.sort_values(
-        by=[sort_col],
+        by=[R391_COL_PI_OUTPUT],
         kind="stable",
         na_position="last",
     ).reset_index(drop=True)
@@ -628,7 +570,7 @@ def relocate_blank_pi_duplicates(df_out: pd.DataFrame) -> pd.DataFrame:
 
 def build_391_excel(df_out: pd.DataFrame) -> bytes:
     date_cols = [R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED]
-    currency_cols = [R391_COL_HOURLY_RATE, R391_COL_MONTHLY_RATE, R391_COL_ANNUAL_RATE]
+    currency_cols = [R391_COL_MONTHLY_RATE, R391_COL_HOURLY_RATE]
 
     xbuf = BytesIO()
     with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
@@ -655,88 +597,10 @@ def build_391_excel(df_out: pd.DataFrame) -> bytes:
                     continue
                 cell.number_format = "0.00"
 
-        # Visually set apart the original raw block (Entity ... Award) from the curated columns
-        raw_block_header_fill = PatternFill(start_color="FFD9E2F3", end_color="FFD9E2F3", fill_type="solid")
-        raw_block_body_fill = PatternFill(start_color="FFEFF3FA", end_color="FFEFF3FA", fill_type="solid")
-        for h in R391_RAW_BLOCK_COLUMNS:
-            if h not in col_map:
-                continue
-            col_letter = get_column_letter(col_map[h])
-            ws[f"{col_letter}1"].fill = raw_block_header_fill
-            for r in range(2, ws.max_row + 1):
-                ws[f"{col_letter}{r}"].fill = raw_block_body_fill
-
-        last_row = ws.max_row
-        last_col_letter = get_column_letter(ws.max_column)
-
-        # Yellow: Expected End Date is upcoming within R391_EXPIRING_SOON_MONTHS months,
-        # OR the date is any time in the past (no lower bound)
-        if R391_COL_EXP_END_DATE in col_map and last_row >= 2:
-            exp_col_letter = get_column_letter(col_map[R391_COL_EXP_END_DATE])
-            yellow_fill = PatternFill(start_color="FFFFF3B0", end_color="FFFFF3B0", fill_type="solid")
-            yellow_formula = (
-                f'AND({exp_col_letter}2<>"",'
-                f'{exp_col_letter}2<=EDATE(TODAY(),{R391_EXPIRING_SOON_MONTHS}))'
-            )
-            ws.conditional_formatting.add(
-                f"{exp_col_letter}2:{exp_col_letter}{last_row}",
-                FormulaRule(formula=[yellow_formula], fill=yellow_fill, stopIfTrue=False),
-            )
-
-        # Red: entire row when Activity is 990000/990001/990002, or Project starts with "DKO"
-        if R391_COL_ACTIVITY in col_map and R391_COL_PROJECT in col_map and last_row >= 2:
-            act_col_letter = get_column_letter(col_map[R391_COL_ACTIVITY])
-            proj_col_letter = get_column_letter(col_map[R391_COL_PROJECT])
-            red_fill = PatternFill(start_color="FFF5C6CB", end_color="FFF5C6CB", fill_type="solid")
-            red_codes = ",".join(f"${act_col_letter}2={code}" for code in sorted(R391_REDFLAG_ACTIVITY_CODES))
-            red_formula = (
-                f'OR({red_codes},'
-                f'LEFT(${proj_col_letter}2,{len(R391_REDFLAG_PROJECT_PREFIX)})="{R391_REDFLAG_PROJECT_PREFIX}")'
-            )
-            # Added first so it takes visual precedence over the yellow cell-level highlight on overlap
-            ws.conditional_formatting.add(
-                f"A2:{last_col_letter}{last_row}",
-                FormulaRule(formula=[red_formula], fill=red_fill, stopIfTrue=False),
-            )
-
-        # Freeze the header row and the first four columns (Principal Investigator, Employee ID,
-        # Employee Name, Job Code Description)
+        # Freeze the header row and the first four columns (Department, PI, Employee ID, Employee Name)
         ws.freeze_panes = "E2"
 
         _auto_width(ws)
-
-        # Legend sheet documenting the color-coding rules directly in the workbook
-        legend_ws = wb.create_sheet("Legend")
-        legend_ws["A1"] = "391 Organized — Legend"
-        legend_ws["A1"].font = Font(bold=True, size=13)
-
-        legend_rows = [
-            ("", ""),
-            ("Shaded blue-gray columns", "Original 391 export columns (Entity through Award), unmodified, kept together for reference."),
-            ("", ""),
-            ("Yellow cell", f"Expected End Date is within {R391_EXPIRING_SOON_MONTHS} months from now, OR is any date already in the past — funding is ending soon or has already ended."),
-            ("", ""),
-            (
-                "Red row",
-                "Activity is 990000, 990001, or 990002, OR Project begins with \"DKO\" — flagged for review.",
-            ),
-            ("", ""),
-            ("Duplicate rows", "Rows that were 100% identical across every column were removed, keeping only the first occurrence."),
-        ]
-        r = 3
-        for label, desc in legend_rows:
-            legend_ws[f"A{r}"] = label
-            legend_ws[f"A{r}"].font = Font(bold=True)
-            legend_ws[f"B{r}"] = desc
-            legend_ws[f"B{r}"].alignment = legend_ws[f"B{r}"].alignment.copy(wrap_text=True)
-            r += 1
-
-        legend_ws["A6"].fill = PatternFill(start_color="FFFFF3B0", end_color="FFFFF3B0", fill_type="solid")
-        legend_ws["A8"].fill = PatternFill(start_color="FFF5C6CB", end_color="FFF5C6CB", fill_type="solid")
-        legend_ws["A4"].fill = raw_block_header_fill
-
-        legend_ws.column_dimensions["A"].width = 24
-        legend_ws.column_dimensions["B"].width = 90
 
     xbuf.seek(0)
     return xbuf.getvalue()
@@ -969,14 +833,6 @@ with st.sidebar:
         award_file = st.file_uploader("Award Info document (.xlsx)", type=["xlsx"])
         hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in output", value=True)
 
-    if db_type == R391_OPTION:
-        st.markdown("#### Sort")
-        r391_sort_choice = st.radio(
-            "Sort by",
-            options=["Principal Investigator", "Employee Name"],
-            index=0,
-        )
-
 if not db_file:
     st.info(
         "Choose PPM, GL, or 391 in the sidebar, then upload the corresponding database file. "
@@ -997,7 +853,7 @@ try:
             sheet_391 = st.selectbox("391 sheet to use", options=xl_391.sheet_names, index=0)
 
         df_391_raw = read_391(db_bytes, sheet_name=sheet_391)
-        df_391_out = organize_391(df_391_raw, sort_by=r391_sort_choice)
+        df_391_out = organize_391(df_391_raw)
 
         _work_check = df_391_raw.copy()
         _has_id = _work_check[R391_COL_EMP_ID].apply(safe_str).ne("")
@@ -1021,25 +877,7 @@ try:
         m4.metric("PI filled/self-assigned", pi_filled)
         m5.metric("Departments", df_391_out["Department"].nunique())
 
-        with st.expander("What the colors and shading mean", expanded=False):
-            st.markdown(
-                f"""
-- **Blue-gray shaded columns** — the original 391 export columns (Entity through Award), kept
-  unmodified and grouped together for reference alongside the organized columns.
-- 🟡 **Yellow cell** (Expected End Date) — the date is within **{R391_EXPIRING_SOON_MONTHS} months**
-  from today, **or** is any date already in the past (ending soon, or already ended).
-- 🔴 **Red row** — Activity is `990000`, `990001`, or `990002`, **or** Project begins with `"DKO"`.
-- **Duplicate rows** that were 100% identical across every column have already been removed,
-  keeping only the first occurrence.
-- **Annual Rate** = Monthly Rate × 9 for job codes containing "Prof" (academic-year), otherwise
-  Monthly Rate × 12.
-
-These rules are also documented on a **Legend** tab in the downloaded Excel file.
-                """
-            )
-
         st.dataframe(df_391_out, use_container_width=True, height=480)
-
 
         report_label_391 = st.text_input(
             "Report label (used in filename)",
