@@ -87,7 +87,7 @@ COLOR_POSITIVE_GREEN = "004B00"   # dark green text
 COLOR_NEGATIVE_RED   = "8B0000"   # dark red text
 
 # 391 (Funding Entry Report) source columns
-R391_COL_FIN_DEPT_DESC = "Financial Department Description"  # AI -> no longer used or output
+R391_COL_FIN_DEPT_DESC = "Financial Department Description"  # AI -> "Department" (first 3 letters), no longer sorted/first
 R391_COL_PI = "Project Principal Investigator"                # AQ -> renamed "Principal Investigator", now first column & sort key
 R391_COL_EMP_ID = "Employee ID"                                # J
 R391_COL_EMP_NAME = "Employee Name"                            # K (note: user referenced "E", but "Employee Name"
@@ -99,14 +99,13 @@ R391_COL_EXP_END_DATE = "Expected End Date"                     # X
 R391_COL_DATE_ADDED = "Date Added"                              # AV
 R391_COL_MONTHLY_RATE = "Monthly Rate"                          # AB
 R391_COL_HOURLY_RATE = "Hourly Rate"                            # AA
-R391_COL_ANNUAL_RATE = "Annual Rate"                            # derived: Monthly Rate x 12
+R391_COL_ANNUAL_RATE = "Annual Rate"                            # derived: Monthly Rate x 9 (Prof job codes) or x 12
 R391_COL_OTC_INDC = "OTC Indc"                                  # AS
 R391_COL_DIST_PCT = "Dist Pct"                                  # AU
 R391_COL_FTE = "FTE"                                            # Y
 
-# Original raw block (Entity through Award), kept under their original header names and
-# original left-to-right order (Financial Department Description excluded), and visually set
-# apart in the output workbook
+# Original raw block, columns AF through AP, kept under their original header names and
+# original left-to-right order, and visually set apart in the output workbook
 R391_COL_ENTITY = "Entity"                                      # AF
 R391_COL_FUND = "Fund"                                          # AG
 R391_COL_FIN_DEPT = "Financial Department"                      # AH
@@ -122,6 +121,7 @@ R391_RAW_BLOCK_COLUMNS = [
     R391_COL_ENTITY,
     R391_COL_FUND,
     R391_COL_FIN_DEPT,
+    R391_COL_FIN_DEPT_DESC,
     R391_COL_DEPT_ROLLUP,
     R391_COL_PURPOSE,
     R391_COL_PROGRAM,
@@ -147,11 +147,11 @@ R391_OUTPUT_COLUMNS = [
     R391_COL_OTC_INDC,
     R391_COL_DIST_PCT,
     R391_COL_FTE,
+    "Department",
 ] + R391_RAW_BLOCK_COLUMNS
 
-# Job Code Description contains any of these (case-insensitive substring) -> the employee is
-# PI of their own funding, so PI is forced to their own name (reformatted "First Last")
-R391_SELF_PI_KEYWORDS = {"PROF", "LECT"}
+# Job Code Description in this set -> the employee is PI of their own funding
+R391_SELF_PI_JOB_CODES = {"PROF-AY", "ADJ PROF-AY", "ASST PROF-AY"}
 
 # Job Code Descriptions to drop entirely from the 391 output
 R391_EXCLUDED_JOB_CODES = {"FINANCIAL ANL SUPV 1", "RSCH ADM 3 RP"}
@@ -488,15 +488,16 @@ def organize_391(df: pd.DataFrame, sort_by: str = None) -> pd.DataFrame:
     """
     Reorganize a raw 391 export into a clean, human-readable table:
       - "Project Principal Investigator" -> "Principal Investigator", first column
+      - "Financial Department Description" -> "Department" (first 3 letters only); retained in
+        the sheet but no longer first
       - Drop rows with a blank Employee ID or Employee Name
       - Drop rows whose Job Code Description is in R391_EXCLUDED_JOB_CODES
       - Where PI is blank, try to match the Employee Name (format "Last, First") against the
         set of known PI names (format "First Last") in this file; if matched, fill PI with it
-      - Where Job Code Description contains "PROF" or "LECT" (case-insensitive, anywhere in the
-        string), the employee is PI of their own funding, so PI is forced to their own name
-        (reformatted "First Last"), overriding whatever the matching step produced
-      - Annual Rate = Monthly Rate x 12, whenever a Monthly Rate exists
-      - Append the original raw block of columns (Entity through Award) unchanged, in
+      - Where Job Code Description is in R391_SELF_PI_JOB_CODES ("PROF-AY", "ADJ PROF-AY",
+        "ASST PROF-AY"), the employee is PI of their own funding, so PI is forced to their own
+        name (reformatted "First Last"), overriding whatever the matching step produced
+      - Append the original raw block of columns AF-AP (Entity through Award) unchanged, in
         their original order (see R391_RAW_BLOCK_COLUMNS)
       - Remove exact-duplicate rows (100% identical across every output column), keeping
         the first occurrence
@@ -508,7 +509,7 @@ def organize_391(df: pd.DataFrame, sort_by: str = None) -> pd.DataFrame:
     sort_col = R391_COL_PI_OUTPUT if sort_by == R391_COL_PI_OUTPUT else R391_COL_EMP_NAME
 
     required = [
-        R391_COL_PI, R391_COL_EMP_ID, R391_COL_EMP_NAME,
+        R391_COL_FIN_DEPT_DESC, R391_COL_PI, R391_COL_EMP_ID, R391_COL_EMP_NAME,
         R391_COL_JOB_DESC, R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED,
         R391_COL_MONTHLY_RATE, R391_COL_HOURLY_RATE, R391_COL_OTC_INDC, R391_COL_DIST_PCT,
         R391_COL_FTE, R391_COL_ENTITY, R391_COL_FUND, R391_COL_FIN_DEPT, R391_COL_DEPT_ROLLUP,
@@ -540,25 +541,30 @@ def organize_391(df: pd.DataFrame, sort_by: str = None) -> pd.DataFrame:
     excluded_upper = {c.upper() for c in R391_EXCLUDED_JOB_CODES}
     work = work[~job_desc_series.str.upper().isin(excluded_upper)].copy()
 
+    work["Department"] = work[R391_COL_FIN_DEPT_DESC].apply(safe_str).str[:3]
+
     pi_series = work[R391_COL_PI].apply(safe_str)
     blank_pi_mask = pi_series.eq("")
     matched_pi = work.loc[blank_pi_mask, R391_COL_EMP_NAME].apply(lambda nm: match_employee_to_pi(nm, pi_lookup))
     pi_series.loc[blank_pi_mask] = matched_pi.fillna("")
 
-    # Employees whose Job Code Description contains "PROF" or "LECT" are PI of their own
-    # funding, regardless of what matching produced
-    job_desc_upper = work[R391_COL_JOB_DESC].apply(safe_str).str.upper()
-    self_pi_mask = pd.Series(False, index=work.index)
-    for keyword in R391_SELF_PI_KEYWORDS:
-        self_pi_mask = self_pi_mask | job_desc_upper.str.contains(keyword, na=False)
+    # PROF-AY employees (and the ADJ/ASST variants) are PI of their own funding,
+    # regardless of what matching produced
+    job_desc_series = work[R391_COL_JOB_DESC].apply(safe_str)
+    self_pi_codes_upper = {c.upper() for c in R391_SELF_PI_JOB_CODES}
+    self_pi_mask = job_desc_series.str.upper().isin(self_pi_codes_upper)
     pi_series.loc[self_pi_mask] = work.loc[self_pi_mask, R391_COL_EMP_NAME].apply(format_employee_as_first_last)
 
     work[R391_COL_PI_OUTPUT] = pi_series
 
-    # Annual Rate: Monthly Rate x 12, whenever a Monthly Rate exists
+    # Annual Rate: Monthly Rate x 9 for "Prof" job codes (academic-year appointments),
+    # otherwise Monthly Rate x 12, whenever a Monthly Rate exists
     monthly_numeric = pd.to_numeric(work[R391_COL_MONTHLY_RATE], errors="coerce")
     has_monthly = monthly_numeric.notna()
-    annual_rate = (monthly_numeric * 12).where(has_monthly)
+    is_prof = work[R391_COL_JOB_DESC].apply(safe_str).str.upper().str.contains("PROF", na=False)
+    annual_rate = monthly_numeric * 12
+    annual_rate = annual_rate.mask(is_prof, monthly_numeric * 9)
+    annual_rate = annual_rate.where(has_monthly)
     work[R391_COL_ANNUAL_RATE] = annual_rate
 
     df_out = work[R391_OUTPUT_COLUMNS].copy()
@@ -716,10 +722,6 @@ def build_391_excel(df_out: pd.DataFrame) -> bytes:
             ),
             ("", ""),
             ("Duplicate rows", "Rows that were 100% identical across every column were removed, keeping only the first occurrence."),
-            ("", ""),
-            ("Annual Rate", "Monthly Rate x 12, whenever a Monthly Rate exists."),
-            ("", ""),
-            ("Principal Investigator", "Set to the employee's own name (reversed to \"First Last\") whenever Job Code Description contains \"PROF\" or \"LECT\"."),
         ]
         r = 3
         for label, desc in legend_rows:
@@ -1017,7 +1019,7 @@ try:
         m2.metric("Dropped (no employee)", _rows_no_employee)
         m3.metric("Dropped (excluded job code)", _rows_excluded_job_code)
         m4.metric("PI filled/self-assigned", pi_filled)
-        m5.metric("Unique PIs", df_391_out[R391_COL_PI_OUTPUT].apply(safe_str).replace("", pd.NA).nunique())
+        m5.metric("Departments", df_391_out["Department"].nunique())
 
         with st.expander("What the colors and shading mean", expanded=False):
             st.markdown(
@@ -1029,9 +1031,8 @@ try:
 - 🔴 **Red row** — Activity is `990000`, `990001`, or `990002`, **or** Project begins with `"DKO"`.
 - **Duplicate rows** that were 100% identical across every column have already been removed,
   keeping only the first occurrence.
-- **Annual Rate** = Monthly Rate × 12, whenever a Monthly Rate exists.
-- **Principal Investigator** is set to the employee's own name (reversed to "First Last") whenever
-  Job Code Description contains "PROF" or "LECT", regardless of what's listed in the source file.
+- **Annual Rate** = Monthly Rate × 9 for job codes containing "Prof" (academic-year), otherwise
+  Monthly Rate × 12.
 
 These rules are also documented on a **Legend** tab in the downloaded Excel file.
                 """
