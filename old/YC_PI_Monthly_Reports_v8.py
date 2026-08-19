@@ -923,150 +923,6 @@ def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFra
 
 
 # -----------------------------
-# GLIDE & Project Costs
-# -----------------------------
-GLIDE_PROJECT_COL_CANDIDATES = ["PPM Project", "GL Project"]
-GLIDE_PROJECT_NAME_COL_CANDIDATES = ["PPM Project Name", "GL Project Name"]
-
-GLIDE_COL_ACCOUNTING_DATE = "Accounting Date"
-GLIDE_COL_DEBIT_AMOUNT = "Debit Amount"
-GLIDE_COL_EXP_TYPE_NAME = "PPM Expenditure Type Name"
-GLIDE_COL_DESCRIPTION = "Description"
-GLIDE_COL_UDF2 = "udfString2"
-GLIDE_COL_UDF4 = "udfString4"
-GLIDE_COL_UDF5 = "udfString5"
-
-GLIDE_FIXED_COLUMNS = [
-    GLIDE_COL_ACCOUNTING_DATE,
-    GLIDE_COL_DEBIT_AMOUNT,
-    GLIDE_COL_EXP_TYPE_NAME,
-    GLIDE_COL_DESCRIPTION,
-    GLIDE_COL_UDF2,
-    GLIDE_COL_UDF4,
-    GLIDE_COL_UDF5,
-]
-
-
-def detect_glide_project_columns(df: pd.DataFrame):
-    """
-    Returns (project_col, project_name_col) using whichever pair is present:
-    "PPM Project"/"PPM Project Name", or "GL Project"/"GL Project Name".
-    """
-    for proj_candidate, name_candidate in zip(GLIDE_PROJECT_COL_CANDIDATES, GLIDE_PROJECT_NAME_COL_CANDIDATES):
-        if proj_candidate in df.columns and name_candidate in df.columns:
-            return proj_candidate, name_candidate
-
-    # Fall back to a mixed match in case only one half is present under each label
-    proj_col = next((c for c in GLIDE_PROJECT_COL_CANDIDATES if c in df.columns), None)
-    name_col = next((c for c in GLIDE_PROJECT_NAME_COL_CANDIDATES if c in df.columns), None)
-    if proj_col and name_col:
-        return proj_col, name_col
-
-    raise KeyError(
-        "GLIDE file must contain either 'PPM Project'/'PPM Project Name' or "
-        "'GL Project'/'GL Project Name' columns. Columns found: " + str(list(df.columns))
-    )
-
-
-def read_glide(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
-    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=0)
-    df.columns = normalize_columns(df.columns)
-    return df
-
-
-def organize_glide(df: pd.DataFrame):
-    """
-    Reorganize a raw GLIDE export into a clean, human-readable table:
-      - Detects whether the file uses "PPM Project"/"PPM Project Name" or
-        "GL Project"/"GL Project Name" and keeps that pair, first and second column
-      - Retains: Accounting Date, Debit Amount, PPM Expenditure Type Name, Description,
-        udfString2, udfString4, udfString5
-      - Sorts by project number, then Accounting Date
-    Returns (df_out, project_col, project_name_col).
-    """
-    proj_col, proj_name_col = detect_glide_project_columns(df)
-
-    missing = [c for c in GLIDE_FIXED_COLUMNS if c not in df.columns]
-    if missing:
-        raise KeyError(f"GLIDE file is missing expected column(s): {missing}. Columns found: {list(df.columns)}")
-
-    output_columns = [proj_col, proj_name_col] + GLIDE_FIXED_COLUMNS
-    df_out = df[output_columns].copy()
-
-    df_out = df_out.sort_values(
-        by=[proj_col, GLIDE_COL_ACCOUNTING_DATE],
-        kind="stable",
-        na_position="last",
-    ).reset_index(drop=True)
-
-    return df_out, proj_col, proj_name_col
-
-
-def _style_glide_sheet(ws, proj_col, currency_cols):
-    _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=11)
-
-    headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
-    col_map = {h: idx + 1 for idx, h in enumerate(headers)}
-    if GLIDE_COL_ACCOUNTING_DATE in col_map:
-        col_letter = get_column_letter(col_map[GLIDE_COL_ACCOUNTING_DATE])
-        for cell in ws[col_letter]:
-            if cell.row <= 1:
-                continue
-            cell.number_format = "MM/DD/YYYY"
-
-    ws.freeze_panes = "A2"
-    _auto_width(ws)
-
-
-def build_glide_master_excel(df_out: pd.DataFrame, proj_col: str) -> bytes:
-    xbuf = BytesIO()
-    with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
-        df_out.to_excel(writer, index=False, sheet_name="GLIDE Master")
-        ws = writer.book["GLIDE Master"]
-        _style_glide_sheet(ws, proj_col, currency_cols=[GLIDE_COL_DEBIT_AMOUNT])
-    xbuf.seek(0)
-    return xbuf.getvalue()
-
-
-def build_glide_project_zip(df_out: pd.DataFrame, proj_col: str, report_label: str) -> bytes:
-    unique_projects = [p for p in df_out[proj_col].apply(safe_str).unique().tolist() if p]
-    unique_projects_sorted = sorted(unique_projects, key=lambda s: s.lower())
-
-    zip_buf = BytesIO()
-    used_names = set()
-
-    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for proj in unique_projects_sorted:
-            group = df_out[df_out[proj_col].apply(safe_str) == proj].copy()
-            if group.empty:
-                continue
-
-            xbuf = BytesIO()
-            with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
-                group.to_excel(writer, index=False, sheet_name="Project Costs")
-                ws = writer.book["Project Costs"]
-                _style_glide_sheet(ws, proj_col, currency_cols=[GLIDE_COL_DEBIT_AMOUNT])
-            xbuf.seek(0)
-
-            safe_proj = make_safe_filename_fragment(proj)
-            filename = f"{report_label} - {safe_proj}.xlsx"
-            if filename in used_names:
-                k = 2
-                while True:
-                    candidate = f"{report_label} - {safe_proj} ({k}).xlsx"
-                    if candidate not in used_names:
-                        filename = candidate
-                        break
-                    k += 1
-            used_names.add(filename)
-
-            zf.writestr(filename, xbuf.read())
-
-    zip_buf.seek(0)
-    return zip_buf.getvalue()
-
-
-# -----------------------------
 # UI
 # -----------------------------
 st.markdown(
@@ -1085,7 +941,6 @@ st.markdown(
 PPM_OPTION = "PPM (Monthly Budget)"
 GL_OPTION = "GL (YTD Expense Table)"
 R391_OPTION = "391 (Funding Entry Report)"
-GLIDE_OPTION = "GLIDE & Project Costs"
 
 # -----------------------------
 # Sidebar: setup / inputs
@@ -1094,18 +949,14 @@ with st.sidebar:
     st.markdown("#### Setup")
     db_type = st.radio(
         "Database type",
-        options=[PPM_OPTION, GL_OPTION, R391_OPTION, GLIDE_OPTION],
+        options=[PPM_OPTION, GL_OPTION, R391_OPTION],
         index=0,
-        help=(
-            "PPM = Aggie Enterprise (PPM export). GL = General Ledger export. "
-            "391 = UCPath Funding Entry Report. GLIDE = GLIDE transaction export."
-        ),
+        help="PPM = Aggie Enterprise (PPM export). GL = General Ledger export. 391 = UCPath Funding Entry Report.",
     )
     uploader_labels = {
         PPM_OPTION: "PPM database (.xlsx)",
         GL_OPTION: "GL database (.xlsx)",
         R391_OPTION: "391 database (.xlsx)",
-        GLIDE_OPTION: "GLIDE database (.xlsx)",
     }
     db_file = st.file_uploader(uploader_labels[db_type], type=["xlsx"])
 
@@ -1126,66 +977,13 @@ with st.sidebar:
 
 if not db_file:
     st.info(
-        "Choose PPM, GL, 391, or GLIDE in the sidebar, then upload the corresponding database file. "
+        "Choose PPM, GL, or 391 in the sidebar, then upload the corresponding database file. "
         "Award Info is only available in PPM mode."
     )
     st.stop()
 
 try:
     db_bytes = db_file.getvalue()
-
-    # ============================================================
-    # GLIDE & PROJECT COSTS MODE
-    # ============================================================
-    if db_type == GLIDE_OPTION:
-        xl_glide = pd.ExcelFile(BytesIO(db_bytes))
-        sheet_glide = xl_glide.sheet_names[0]
-        if len(xl_glide.sheet_names) > 1:
-            sheet_glide = st.selectbox("GLIDE sheet to use", options=xl_glide.sheet_names, index=0)
-
-        df_glide_raw = read_glide(db_bytes, sheet_name=sheet_glide)
-        df_glide_out, glide_proj_col, glide_proj_name_col = organize_glide(df_glide_raw)
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Transactions", len(df_glide_out))
-        m2.metric("Unique Projects", df_glide_out[glide_proj_col].apply(safe_str).nunique())
-        m3.metric("Total Debit Amount", f"${pd.to_numeric(df_glide_out[GLIDE_COL_DEBIT_AMOUNT], errors='coerce').fillna(0).sum():,.2f}")
-
-        st.caption(
-            f"Detected project columns: **{glide_proj_col}** / **{glide_proj_name_col}**. "
-            f"Sorted by {glide_proj_col}, then {GLIDE_COL_ACCOUNTING_DATE}."
-        )
-
-        st.dataframe(df_glide_out, use_container_width=True, height=480)
-
-        glide_report_label = st.text_input(
-            "Report label (used in filenames)",
-            value=f"GLIDE_Project_Costs_{date.today().strftime('%Y-%m-%d')}",
-        )
-
-        gc1, gc2 = st.columns(2)
-        with gc1:
-            if st.button("Generate Master Excel", type="primary", use_container_width=True):
-                master_bytes = build_glide_master_excel(df_glide_out, glide_proj_col)
-                st.success("Master Excel generated!")
-                st.download_button(
-                    "Download Master Excel",
-                    data=master_bytes,
-                    file_name=f"{make_safe_filename_fragment(glide_report_label)} - Master.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-        with gc2:
-            if st.button("Generate ZIP (one Excel per Project)", type="primary", use_container_width=True):
-                zip_bytes = build_glide_project_zip(df_glide_out, glide_proj_col, glide_report_label)
-                st.success("ZIP generated!")
-                st.download_button(
-                    "Download ZIP (Project files)",
-                    data=zip_bytes,
-                    file_name=f"{make_safe_filename_fragment(glide_report_label)} - Project Files.zip",
-                    mime="application/zip",
-                )
-
-        st.stop()
 
     # ============================================================
     # 391 MODE
