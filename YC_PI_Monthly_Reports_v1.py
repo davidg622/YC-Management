@@ -932,9 +932,17 @@ GLIDE_COL_ACCOUNTING_DATE = "Accounting Date"
 GLIDE_COL_DEBIT_AMOUNT = "Debit Amount"
 GLIDE_COL_EXP_TYPE_NAME = "PPM Expenditure Type Name"
 GLIDE_COL_DESCRIPTION = "Description"
+GLIDE_COL_TASK = "PPM Task"
 GLIDE_COL_UDF2 = "udfString2"
 GLIDE_COL_UDF4 = "udfString4"
 GLIDE_COL_UDF5 = "udfString5"
+
+# Display names for the udfString columns in the organized output
+GLIDE_UDF_RENAME_MAP = {
+    GLIDE_COL_UDF2: "Description_1",
+    GLIDE_COL_UDF4: "Description_2",
+    GLIDE_COL_UDF5: "Description_3",
+}
 
 GLIDE_FIXED_COLUMNS = [
     GLIDE_COL_ACCOUNTING_DATE,
@@ -978,20 +986,23 @@ def organize_glide(df: pd.DataFrame):
     """
     Reorganize a raw GLIDE export into a clean, human-readable table:
       - Detects whether the file uses "PPM Project"/"PPM Project Name" or
-        "GL Project"/"GL Project Name" and keeps that pair, first and second column
-      - Retains: Accounting Date, Debit Amount, PPM Expenditure Type Name, Description,
-        udfString2, udfString4, udfString5
+        "GL Project"/"GL Project Name" and keeps that pair; "PPM Task" is inserted
+        immediately after the project column
+      - Retains: PPM Task, Accounting Date, Debit Amount, PPM Expenditure Type Name,
+        Description, udfString2, udfString4, udfString5 (renamed to Description_1/2/3)
       - Sorts by project number, then Accounting Date
     Returns (df_out, project_col, project_name_col).
     """
     proj_col, proj_name_col = detect_glide_project_columns(df)
 
-    missing = [c for c in GLIDE_FIXED_COLUMNS if c not in df.columns]
+    required = GLIDE_FIXED_COLUMNS + [GLIDE_COL_TASK]
+    missing = [c for c in required if c not in df.columns]
     if missing:
         raise KeyError(f"GLIDE file is missing expected column(s): {missing}. Columns found: {list(df.columns)}")
 
-    output_columns = [proj_col, proj_name_col] + GLIDE_FIXED_COLUMNS
+    output_columns = [proj_col, GLIDE_COL_TASK, proj_name_col] + GLIDE_FIXED_COLUMNS
     df_out = df[output_columns].copy()
+    df_out = df_out.rename(columns=GLIDE_UDF_RENAME_MAP)
 
     df_out = df_out.sort_values(
         by=[proj_col, GLIDE_COL_ACCOUNTING_DATE],
@@ -1067,6 +1078,142 @@ def build_glide_project_zip(df_out: pd.DataFrame, proj_col: str, report_label: s
 
 
 # -----------------------------
+# 339 Pivot Generator
+# -----------------------------
+R339_COL_PROJECT = "Project"
+R339_COL_ACTIVITY = "Activity"
+R339_COL_TASK = "Task"
+R339_COL_EMP_NAME = "Employee Name"
+R339_COL_EMP_ID = "Employee ID"
+R339_COL_JOB_CODE = "Job Code"
+R339_COL_UC_EARN_DATE = "UC Earn End Date"  # closest match to the requested "UC Earn Date";
+                                             # this source file has no column named exactly "UC Earn Date"
+R339_COL_MONTHLY_RATE = "Monthly Rate"
+R339_COL_EXPENSE_TYPE = "Expense Type"
+R339_COL_MONETARY_AMOUNT = "Monetary Amount"
+
+R339_OUTPUT_COLUMNS = [
+    R339_COL_PROJECT,
+    R339_COL_ACTIVITY,
+    R339_COL_TASK,
+    R339_COL_EMP_NAME,
+    R339_COL_EMP_ID,
+    R339_COL_JOB_CODE,
+    R339_COL_UC_EARN_DATE,
+    R339_COL_MONTHLY_RATE,
+    R339_COL_EXPENSE_TYPE,
+    R339_COL_MONETARY_AMOUNT,
+]
+
+R339_SORT_BY_PROJECT = "Project"
+R339_SORT_BY_EMPLOYEE = "Employee Name"
+
+
+def read_339(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
+    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=0)
+    df.columns = normalize_columns(df.columns)
+    return df
+
+
+def organize_339(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim a raw 339 export down to just the columns this module works with."""
+    missing = [c for c in R339_OUTPUT_COLUMNS if c not in df.columns]
+    if missing:
+        raise KeyError(f"339 file is missing expected column(s): {missing}. Columns found: {list(df.columns)}")
+    return df[R339_OUTPUT_COLUMNS].copy()
+
+
+def filter_339_date_range(df_out: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
+    dates = pd.to_datetime(df_out[R339_COL_UC_EARN_DATE], errors="coerce")
+    mask = dates.notna() & (dates >= pd.Timestamp(start_date)) & (dates <= pd.Timestamp(end_date))
+    return df_out[mask].copy()
+
+
+def build_339_group_excel(group_df: pd.DataFrame, row_fields: list) -> bytes:
+    """
+    Build a two-sheet workbook for one group (one Project, or one Employee):
+      Sheet 1 "Pivot" - Monetary Amount summed, columns = UC Earn End Date, rows = row_fields
+      Sheet 2 "Data"  - the underlying trimmed/filtered rows for this group
+    """
+    pivot = pd.pivot_table(
+        group_df,
+        values=R339_COL_MONETARY_AMOUNT,
+        index=row_fields,
+        columns=R339_COL_UC_EARN_DATE,
+        aggfunc="sum",
+        fill_value=0,
+    )
+    pivot.columns = [
+        c.strftime("%m/%d/%Y") if isinstance(c, pd.Timestamp) else safe_str(c) for c in pivot.columns
+    ]
+    pivot = pivot.reset_index()
+    date_col_headers = [c for c in pivot.columns if c not in row_fields]
+
+    xbuf = BytesIO()
+    with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
+        pivot.to_excel(writer, index=False, sheet_name="Pivot")
+        group_df.to_excel(writer, index=False, sheet_name="Data")
+        wb = writer.book
+
+        ws_pivot = wb["Pivot"]
+        _style_table_sheet(ws_pivot, header_row=1, start_data_row=2, currency_headers=date_col_headers, font_size=11)
+        ws_pivot.freeze_panes = get_column_letter(len(row_fields) + 1) + "2"
+        _auto_width(ws_pivot)
+
+        ws_data = wb["Data"]
+        _style_table_sheet(
+            ws_data, header_row=1, start_data_row=2,
+            currency_headers=[R339_COL_MONTHLY_RATE, R339_COL_MONETARY_AMOUNT], font_size=11,
+        )
+        headers = [c.value for c in next(ws_data.iter_rows(min_row=1, max_row=1))]
+        col_map = {h: idx + 1 for idx, h in enumerate(headers)}
+        if R339_COL_UC_EARN_DATE in col_map:
+            col_letter = get_column_letter(col_map[R339_COL_UC_EARN_DATE])
+            for cell in ws_data[col_letter]:
+                if cell.row <= 1:
+                    continue
+                cell.number_format = "MM/DD/YYYY"
+        ws_data.freeze_panes = "A2"
+        _auto_width(ws_data)
+
+    xbuf.seek(0)
+    return xbuf.getvalue()
+
+
+def build_339_zip(df_filtered: pd.DataFrame, split_col: str, row_fields: list, date_label: str) -> bytes:
+    groups = [g for g in df_filtered[split_col].apply(safe_str).unique().tolist() if g]
+    groups_sorted = sorted(groups, key=lambda s: s.lower())
+
+    zip_buf = BytesIO()
+    used_names = set()
+
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for group_val in groups_sorted:
+            group_df = df_filtered[df_filtered[split_col].apply(safe_str) == group_val].copy()
+            if group_df.empty:
+                continue
+
+            xbytes = build_339_group_excel(group_df, row_fields)
+
+            safe_group = make_safe_filename_fragment(group_val)
+            filename = f"339_{safe_group}_{date_label}.xlsx"
+            if filename in used_names:
+                k = 2
+                while True:
+                    candidate = f"339_{safe_group}_{date_label} ({k}).xlsx"
+                    if candidate not in used_names:
+                        filename = candidate
+                        break
+                    k += 1
+            used_names.add(filename)
+
+            zf.writestr(filename, xbytes)
+
+    zip_buf.seek(0)
+    return zip_buf.getvalue()
+
+
+# -----------------------------
 # UI
 # -----------------------------
 st.markdown(
@@ -1086,6 +1233,7 @@ PPM_OPTION = "PPM (Monthly Budget)"
 GL_OPTION = "GL (YTD Expense Table)"
 R391_OPTION = "391 (Funding Entry Report)"
 GLIDE_OPTION = "GLIDE & Project Costs"
+R339_OPTION = "339 Pivot Generator"
 
 # -----------------------------
 # Sidebar: setup / inputs
@@ -1094,11 +1242,12 @@ with st.sidebar:
     st.markdown("#### Setup")
     db_type = st.radio(
         "Database type",
-        options=[PPM_OPTION, GL_OPTION, R391_OPTION, GLIDE_OPTION],
+        options=[PPM_OPTION, GL_OPTION, R391_OPTION, GLIDE_OPTION, R339_OPTION],
         index=0,
         help=(
             "PPM = Aggie Enterprise (PPM export). GL = General Ledger export. "
-            "391 = UCPath Funding Entry Report. GLIDE = GLIDE transaction export."
+            "391 = UCPath Funding Entry Report. GLIDE = GLIDE transaction export. "
+            "339 = Distribution of Payroll Expense Report."
         ),
     )
     uploader_labels = {
@@ -1106,6 +1255,7 @@ with st.sidebar:
         GL_OPTION: "GL database (.xlsx)",
         R391_OPTION: "391 database (.xlsx)",
         GLIDE_OPTION: "GLIDE database (.xlsx)",
+        R339_OPTION: "339 database (.xlsx)",
     }
     db_file = st.file_uploader(uploader_labels[db_type], type=["xlsx"])
 
@@ -1124,15 +1274,100 @@ with st.sidebar:
             index=0,
         )
 
+    if db_type == R339_OPTION:
+        st.markdown("#### Sort")
+        r339_sort_choice = st.radio(
+            "Sort by",
+            options=[R339_SORT_BY_PROJECT, R339_SORT_BY_EMPLOYEE],
+            index=0,
+        )
+
 if not db_file:
     st.info(
-        "Choose PPM, GL, 391, or GLIDE in the sidebar, then upload the corresponding database file. "
+        "Choose PPM, GL, 391, GLIDE, or 339 in the sidebar, then upload the corresponding database file. "
         "Award Info is only available in PPM mode."
     )
     st.stop()
 
 try:
     db_bytes = db_file.getvalue()
+
+    # ============================================================
+    # 339 PIVOT GENERATOR MODE
+    # ============================================================
+    if db_type == R339_OPTION:
+        xl_339 = pd.ExcelFile(BytesIO(db_bytes))
+        sheet_339 = xl_339.sheet_names[0]
+        if len(xl_339.sheet_names) > 1:
+            sheet_339 = st.selectbox("339 sheet to use", options=xl_339.sheet_names, index=0)
+
+        df_339_raw = read_339(db_bytes, sheet_name=sheet_339)
+        df_339_trimmed = organize_339(df_339_raw)
+
+        earn_dates = pd.to_datetime(df_339_trimmed[R339_COL_UC_EARN_DATE], errors="coerce").dropna()
+        if earn_dates.empty:
+            st.error(f"No usable dates found in '{R339_COL_UC_EARN_DATE}'.")
+            st.stop()
+
+        data_min_date = earn_dates.min().date()
+        data_max_date = earn_dates.max().date()
+        default_start = max(data_min_date, (pd.Timestamp(data_max_date) - pd.DateOffset(months=6)).date())
+
+        st.markdown("#### Date range (UC Earn End Date)")
+        date_range = st.date_input(
+            "Select range",
+            value=(default_start, data_max_date),
+            min_value=data_min_date,
+            max_value=data_max_date,
+        )
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            range_start, range_end = date_range
+        else:
+            # user has only picked one endpoint so far
+            range_start, range_end = default_start, data_max_date
+
+        df_339_filtered = filter_339_date_range(df_339_trimmed, range_start, range_end)
+
+        if r339_sort_choice == R339_SORT_BY_PROJECT:
+            split_col = R339_COL_PROJECT
+            row_fields = [R339_COL_EMP_NAME, R339_COL_EXPENSE_TYPE]
+        else:
+            split_col = R339_COL_EMP_NAME
+            row_fields = [R339_COL_PROJECT, R339_COL_EXPENSE_TYPE]
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Rows in range", len(df_339_filtered))
+        m2.metric("Unique Projects", df_339_filtered[R339_COL_PROJECT].apply(safe_str).nunique())
+        m3.metric("Unique Employees", df_339_filtered[R339_COL_EMP_NAME].apply(safe_str).nunique())
+        m4.metric(
+            "Total Monetary Amount",
+            f"${pd.to_numeric(df_339_filtered[R339_COL_MONETARY_AMOUNT], errors='coerce').fillna(0).sum():,.2f}",
+        )
+
+        st.caption(
+            f"Splitting into one file per **{split_col}**, with pivot rows "
+            f"**{row_fields[0]}** then **{row_fields[1]}**, columns = {R339_COL_UC_EARN_DATE}, "
+            f"values = sum of {R339_COL_MONETARY_AMOUNT}."
+        )
+
+        st.dataframe(df_339_filtered, use_container_width=True, height=480)
+
+        date_label = st.text_input(
+            "Download date (used in filenames)",
+            value=date.today().strftime("%Y-%m-%d"),
+        )
+
+        if st.button("Generate ZIP (one Excel per " + split_col + ")", type="primary", use_container_width=True):
+            zip_bytes = build_339_zip(df_339_filtered, split_col, row_fields, date_label)
+            st.success("ZIP generated!")
+            st.download_button(
+                "Download ZIP (339 Pivot files)",
+                data=zip_bytes,
+                file_name=f"339_Pivot_{make_safe_filename_fragment(date_label)}.zip",
+                mime="application/zip",
+            )
+
+        st.stop()
 
     # ============================================================
     # GLIDE & PROJECT COSTS MODE
