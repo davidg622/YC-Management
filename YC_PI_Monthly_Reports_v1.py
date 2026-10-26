@@ -1129,6 +1129,176 @@ def filter_339_date_range(df_out: pd.DataFrame, start_date, end_date) -> pd.Data
     return df_out[mask].copy()
 
 
+R339_PREVIEW_MONTHS = 3
+R339_CHANGE_TOLERANCE = 0.01  # dollars; paycheck differences smaller than one cent are ignored
+
+R339_STATUS_CHANGED = "⚠️ Changed"
+R339_STATUS_NEW = "🆕 New"
+R339_STATUS_SAME = "✓ No change"
+R339_STATUS_INACTIVE = "— Inactive"
+
+# One "pay line" = one Project x Employee x Expense Type (the granularity of the pivot rows)
+R339_LINE_KEY = [R339_COL_PROJECT, R339_COL_EMP_NAME, R339_COL_EXPENSE_TYPE]
+
+
+@st.cache_data(show_spinner=False)
+def list_excel_sheets(file_bytes: bytes) -> list:
+    return pd.ExcelFile(BytesIO(file_bytes)).sheet_names
+
+
+@st.cache_data(show_spinner="Reading 339 report...")
+def load_339_trimmed(file_bytes: bytes, sheet_name) -> pd.DataFrame:
+    return organize_339(read_339(file_bytes, sheet_name=sheet_name))
+
+
+def compute_339_line_changes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flag month-over-month pay changes, one row per pay line (Project x Employee x Expense Type).
+
+    For each line, its most recent paycheck ("Current") is compared with its most recent paycheck
+    in the previous calendar month ("Prior"). Comparing paychecks rather than monthly totals keeps
+    partial months and months with different numbers of pay periods from looking like changes.
+
+      - Changed:  Current differs from Prior by at least one cent
+      - New:      the line was paid in its current month but not in the month before
+      - No change
+      - Inactive: the line's latest paycheck is older than the previous calendar month, relative
+                  to the most recent month in the data (no longer being paid)
+
+    Lines not yet paid in the most recent month (e.g. month-end payroll that hasn't posted) are
+    compared on their own latest month, so they are not mistaken for ended funding.
+    """
+    out_cols = R339_LINE_KEY + ["Current Pay Date", "Current", "Prior Pay Date", "Prior", "Change", "Status"]
+    d = df[R339_LINE_KEY + [R339_COL_UC_EARN_DATE, R339_COL_MONETARY_AMOUNT]].copy()
+    d[R339_COL_UC_EARN_DATE] = pd.to_datetime(d[R339_COL_UC_EARN_DATE], errors="coerce")
+    d[R339_COL_MONETARY_AMOUNT] = pd.to_numeric(d[R339_COL_MONETARY_AMOUNT], errors="coerce").fillna(0.0)
+    for c in R339_LINE_KEY:
+        d[c] = d[c].apply(safe_str)
+    d = d.dropna(subset=[R339_COL_UC_EARN_DATE])
+    if d.empty:
+        return pd.DataFrame(columns=out_cols)
+
+    d["Month"] = d[R339_COL_UC_EARN_DATE].dt.to_period("M")
+    latest_month = d["Month"].max()
+
+    per_pay = (
+        d.groupby(R339_LINE_KEY + [R339_COL_UC_EARN_DATE, "Month"], as_index=False)[R339_COL_MONETARY_AMOUNT]
+        .sum()
+        .sort_values(R339_COL_UC_EARN_DATE, kind="stable")
+    )
+
+    current = (
+        per_pay.groupby(R339_LINE_KEY, as_index=False).tail(1)
+        .rename(columns={
+            R339_COL_UC_EARN_DATE: "Current Pay Date",
+            R339_COL_MONETARY_AMOUNT: "Current",
+            "Month": "Current Month",
+        })
+    )
+    current["Prior Month"] = current["Current Month"] - 1
+
+    prior = (
+        per_pay.groupby(R339_LINE_KEY + ["Month"], as_index=False).tail(1)
+        .rename(columns={
+            R339_COL_UC_EARN_DATE: "Prior Pay Date",
+            R339_COL_MONETARY_AMOUNT: "Prior",
+            "Month": "Prior Month",
+        })
+    )
+
+    lines = current.merge(prior, on=R339_LINE_KEY + ["Prior Month"], how="left")
+
+    diff = (lines["Current"] - lines["Prior"]).round(2)
+    has_prior = lines["Prior"].notna()
+
+    status = pd.Series(R339_STATUS_SAME, index=lines.index, dtype="object")
+    status.loc[~has_prior] = R339_STATUS_NEW
+    status.loc[has_prior & (diff.abs() >= R339_CHANGE_TOLERANCE)] = R339_STATUS_CHANGED
+    status.loc[lines["Current Month"] < (latest_month - 1)] = R339_STATUS_INACTIVE
+    lines["Status"] = status
+
+    lines["Change"] = diff.where(lines["Status"] == R339_STATUS_CHANGED)
+    return lines[out_cols].reset_index(drop=True)
+
+
+def summarize_339_changes(lines: pd.DataFrame, split_col: str) -> pd.DataFrame:
+    """Roll pay-line statuses up to one row per Project (or Employee) for the clickable list."""
+    cols = [split_col, "Status", "Lines changed", "Active lines", "Net change ($/paycheck)"]
+    if lines.empty:
+        return pd.DataFrame(columns=cols)
+
+    rows = []
+    for item, grp in lines.groupby(split_col, sort=False):
+        if not safe_str(item):
+            continue
+        n_changed = int((grp["Status"] == R339_STATUS_CHANGED).sum())
+        n_new = int((grp["Status"] == R339_STATUS_NEW).sum())
+        n_same = int((grp["Status"] == R339_STATUS_SAME).sum())
+        if n_changed:
+            item_status = R339_STATUS_CHANGED
+        elif n_new:
+            item_status = R339_STATUS_NEW
+        elif n_same:
+            item_status = R339_STATUS_SAME
+        else:
+            item_status = R339_STATUS_INACTIVE
+        rows.append({
+            split_col: item,
+            "Status": item_status,
+            "Lines changed": n_changed,
+            "Active lines": n_changed + n_new + n_same,
+            "Net change ($/paycheck)": float(grp.loc[grp["Status"] == R339_STATUS_CHANGED, "Change"].sum()),
+        })
+
+    out = pd.DataFrame(rows, columns=cols)
+    return out.sort_values(split_col, key=lambda s: s.str.lower(), kind="stable").reset_index(drop=True)
+
+
+def build_339_preview_pivot(df: pd.DataFrame, split_col: str, item: str, row_fields: list,
+                            line_changes: pd.DataFrame, months: int = R339_PREVIEW_MONTHS):
+    """
+    On-screen example pivot for one Project (or Employee), limited to the last `months` calendar
+    months of the data. Returns (pivot_df, window_label). Same layout as the exported Pivot sheet,
+    plus the pay-change status for each row.
+    """
+    d = df.copy()
+    d[R339_COL_UC_EARN_DATE] = pd.to_datetime(d[R339_COL_UC_EARN_DATE], errors="coerce")
+    d[R339_COL_MONETARY_AMOUNT] = pd.to_numeric(d[R339_COL_MONETARY_AMOUNT], errors="coerce").fillna(0.0)
+    d = d.dropna(subset=[R339_COL_UC_EARN_DATE])
+    if d.empty:
+        return pd.DataFrame(), ""
+
+    latest_month = d[R339_COL_UC_EARN_DATE].dt.to_period("M").max()
+    first_month = latest_month - (months - 1)
+    window_label = f"{first_month.strftime('%b %Y')} – {latest_month.strftime('%b %Y')}"
+    window_start = first_month.start_time
+
+    for c in [split_col] + row_fields:
+        d[c] = d[c].apply(safe_str)
+    d = d[(d[split_col] == item) & (d[R339_COL_UC_EARN_DATE] >= window_start)]
+    if d.empty:
+        return pd.DataFrame(), window_label
+
+    pivot = pd.pivot_table(
+        d,
+        values=R339_COL_MONETARY_AMOUNT,
+        index=row_fields,
+        columns=R339_COL_UC_EARN_DATE,
+        aggfunc="sum",
+        fill_value=0,
+    )
+    pivot.columns = [c.strftime("%m/%d/%Y") for c in pivot.columns]
+    pivot = pivot.reset_index()
+
+    if not line_changes.empty:
+        lc = line_changes[line_changes[split_col].apply(safe_str) == item]
+        lc = lc[row_fields + ["Status", "Change"]].rename(columns={"Status": "Pay change", "Change": "Change ($)"})
+        pivot = pivot.merge(lc, on=row_fields, how="left")
+        pivot["Pay change"] = pivot["Pay change"].fillna("")
+
+    return pivot, window_label
+
+
 def build_339_group_excel(group_df: pd.DataFrame, row_fields: list) -> bytes:
     """
     Build a two-sheet workbook for one group (one Project, or one Employee):
@@ -1274,6 +1444,13 @@ with st.sidebar:
             index=0,
         )
 
+    # 339 state shared with the main panel below
+    r339_df_trimmed = None
+    r339_data_min = None
+    r339_range_start = None
+    r339_range_end = None
+    r339_sidebar_msg = None
+
     if db_type == R339_OPTION:
         st.markdown("#### Sort")
         r339_sort_choice = st.radio(
@@ -1281,6 +1458,41 @@ with st.sidebar:
             options=[R339_SORT_BY_PROJECT, R339_SORT_BY_EMPLOYEE],
             index=0,
         )
+
+        if db_file:
+            try:
+                _bytes_339 = db_file.getvalue()
+                _sheets_339 = list_excel_sheets(_bytes_339)
+                _sheet_339 = _sheets_339[0]
+                if len(_sheets_339) > 1:
+                    _sheet_339 = st.selectbox("339 sheet to use", options=_sheets_339, index=0)
+
+                r339_df_trimmed = load_339_trimmed(_bytes_339, _sheet_339)
+                _earn_dates = pd.to_datetime(r339_df_trimmed[R339_COL_UC_EARN_DATE], errors="coerce").dropna()
+                if _earn_dates.empty:
+                    raise ValueError(f"No usable dates found in '{R339_COL_UC_EARN_DATE}'.")
+
+                r339_data_min = _earn_dates.min().date()
+                _data_max = _earn_dates.max().date()
+                # Default: six months before the latest date, through the latest date
+                _default_start = max(r339_data_min, (pd.Timestamp(_data_max) - pd.DateOffset(months=6)).date())
+
+                st.markdown("#### Date range")
+                _picked = st.date_input(
+                    "UC Earn End Date range",
+                    value=(_default_start, _data_max),
+                    min_value=r339_data_min,
+                    max_value=_data_max,
+                    key=f"r339_dates_{db_file.name}_{len(_bytes_339)}_{_sheet_339}",
+                )
+                if isinstance(_picked, (tuple, list)) and len(_picked) == 2:
+                    r339_range_start, r339_range_end = _picked
+                else:
+                    r339_sidebar_msg = "Pick an end date to finish the date range."
+            except Exception as _e339:
+                r339_df_trimmed = None
+                r339_sidebar_msg = f"Could not read the 339 file: {_e339}"
+                st.error(r339_sidebar_msg)
 
 if not db_file:
     st.info(
@@ -1296,37 +1508,18 @@ try:
     # 339 PIVOT GENERATOR MODE
     # ============================================================
     if db_type == R339_OPTION:
-        xl_339 = pd.ExcelFile(BytesIO(db_bytes))
-        sheet_339 = xl_339.sheet_names[0]
-        if len(xl_339.sheet_names) > 1:
-            sheet_339 = st.selectbox("339 sheet to use", options=xl_339.sheet_names, index=0)
-
-        df_339_raw = read_339(db_bytes, sheet_name=sheet_339)
-        df_339_trimmed = organize_339(df_339_raw)
-
-        earn_dates = pd.to_datetime(df_339_trimmed[R339_COL_UC_EARN_DATE], errors="coerce").dropna()
-        if earn_dates.empty:
-            st.error(f"No usable dates found in '{R339_COL_UC_EARN_DATE}'.")
+        if r339_df_trimmed is None:
+            st.warning(r339_sidebar_msg or "Could not read the 339 file.")
+            st.stop()
+        if r339_range_start is None or r339_range_end is None:
+            st.info(r339_sidebar_msg or "Pick an end date to finish the date range.")
             st.stop()
 
-        data_min_date = earn_dates.min().date()
-        data_max_date = earn_dates.max().date()
-        default_start = max(data_min_date, (pd.Timestamp(data_max_date) - pd.DateOffset(months=6)).date())
-
-        st.markdown("#### Date range (UC Earn End Date)")
-        date_range = st.date_input(
-            "Select range",
-            value=(default_start, data_max_date),
-            min_value=data_min_date,
-            max_value=data_max_date,
-        )
-        if isinstance(date_range, tuple) and len(date_range) == 2:
-            range_start, range_end = date_range
-        else:
-            # user has only picked one endpoint so far
-            range_start, range_end = default_start, data_max_date
-
-        df_339_filtered = filter_339_date_range(df_339_trimmed, range_start, range_end)
+        df_339_trimmed = r339_df_trimmed
+        df_339_filtered = filter_339_date_range(df_339_trimmed, r339_range_start, r339_range_end)
+        # Pay-change flags and the 3-month preview look back from the END of the selected range,
+        # so they use everything up to that date regardless of the range's start date.
+        df_339_lookback = filter_339_date_range(df_339_trimmed, r339_data_min, r339_range_end)
 
         if r339_sort_choice == R339_SORT_BY_PROJECT:
             split_col = R339_COL_PROJECT
@@ -1334,23 +1527,103 @@ try:
         else:
             split_col = R339_COL_EMP_NAME
             row_fields = [R339_COL_PROJECT, R339_COL_EXPENSE_TYPE]
+        item_noun = "project" if split_col == R339_COL_PROJECT else "employee"
+
+        line_changes_339 = compute_339_line_changes(df_339_lookback)
+        item_summary_339 = summarize_339_changes(line_changes_339, split_col)
+        items_in_range_339 = set(df_339_filtered[split_col].apply(safe_str).unique())
+        item_summary_339 = item_summary_339[item_summary_339[split_col].isin(items_in_range_339)].reset_index(drop=True)
+        n_flagged_339 = int((item_summary_339["Status"] == R339_STATUS_CHANGED).sum())
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Rows in range", len(df_339_filtered))
         m2.metric("Unique Projects", df_339_filtered[R339_COL_PROJECT].apply(safe_str).nunique())
         m3.metric("Unique Employees", df_339_filtered[R339_COL_EMP_NAME].apply(safe_str).nunique())
-        m4.metric(
-            "Total Monetary Amount",
-            f"${pd.to_numeric(df_339_filtered[R339_COL_MONETARY_AMOUNT], errors='coerce').fillna(0).sum():,.2f}",
+        m4.metric(f"{item_noun.capitalize()}s with pay changes", n_flagged_339)
+
+        _latest_ts = pd.to_datetime(df_339_lookback[R339_COL_UC_EARN_DATE], errors="coerce").max()
+        with st.expander("How pay changes are flagged", expanded=False):
+            st.markdown(
+                f"""
+- Each **pay line** (Project × Employee × Expense Type) has its **latest paycheck** compared with its
+  **latest paycheck in the previous calendar month**. Latest pay date in range: **{_latest_ts:%m/%d/%Y}**.
+- ⚠️ **Changed** — the two paychecks differ by at least one cent. 🆕 **New** — paid this month, nothing the month before.
+  ✓ **No change**. — **Inactive** — no pay in the last two months.
+- Pay lines not yet paid in the most recent month (for example month-end payroll that has not posted yet) are
+  compared using their own most recent month instead, so they are not mistaken for ended funding.
+- A {item_noun} is flagged if **any** of its pay lines changed. *Net change* is the sum of the per-paycheck
+  differences on those lines.
+- The flags and the 3-month preview look back from the **end** of the selected date range.
+                """
+            )
+
+        st.markdown(f"#### {item_noun.capitalize()} list")
+        only_flagged = st.checkbox(
+            f"Show only {item_noun}s with pay changes", value=False, key="r339_only_flagged",
         )
+        view_df = item_summary_339
+        if only_flagged:
+            view_df = view_df[view_df["Status"] == R339_STATUS_CHANGED].reset_index(drop=True)
+
+        col_list, col_preview = st.columns([2, 3])
+
+        selected_item = None
+        list_config = {
+            "Net change ($/paycheck)": st.column_config.NumberColumn(format="$%.2f"),
+        }
+        with col_list:
+            st.caption(f"{len(view_df)} {item_noun}(s) shown. Click a row to preview its pivot.")
+            if view_df.empty:
+                st.info("Nothing to show for the current filter.")
+            else:
+                try:
+                    event = st.dataframe(
+                        view_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=460,
+                        on_select="rerun",
+                        selection_mode="single-row",
+                        column_config=list_config,
+                        key=f"r339_items_{split_col}_{only_flagged}",
+                    )
+                    _rows = list(event.selection.rows)
+                    if _rows and _rows[0] < len(view_df):
+                        selected_item = view_df.iloc[_rows[0]][split_col]
+                except TypeError:
+                    # Older Streamlit without row selection: fall back to a dropdown
+                    st.dataframe(view_df, use_container_width=True, hide_index=True, height=360, column_config=list_config)
+                    selected_item = st.selectbox(f"Select a {item_noun}", options=view_df[split_col].tolist())
+
+        with col_preview:
+            if selected_item is None:
+                st.info(f"Select a {item_noun} on the left to see its pivot for the last {R339_PREVIEW_MONTHS} months.")
+            else:
+                preview_df, window_label = build_339_preview_pivot(
+                    df_339_lookback, split_col, selected_item, row_fields, line_changes_339,
+                )
+                st.markdown(f"**{selected_item}**")
+                st.caption(f"Pivot preview, last {R339_PREVIEW_MONTHS} months ({window_label})")
+                if preview_df.empty:
+                    st.info("No pay recorded for this selection in that window.")
+                else:
+                    preview_config = {
+                        c: st.column_config.NumberColumn(format="$%.2f")
+                        for c in preview_df.columns
+                        if c not in row_fields and c != "Pay change"
+                    }
+                    st.dataframe(preview_df, use_container_width=True, hide_index=True, column_config=preview_config)
+
+        st.divider()
+
+        with st.expander("Filtered data (all rows in the selected range)", expanded=False):
+            st.dataframe(df_339_filtered, use_container_width=True, height=420)
 
         st.caption(
-            f"Splitting into one file per **{split_col}**, with pivot rows "
+            f"The ZIP below splits the selected range into one file per **{split_col}**, with pivot rows "
             f"**{row_fields[0]}** then **{row_fields[1]}**, columns = {R339_COL_UC_EARN_DATE}, "
             f"values = sum of {R339_COL_MONETARY_AMOUNT}."
         )
-
-        st.dataframe(df_339_filtered, use_container_width=True, height=480)
 
         date_label = st.text_input(
             "Download date (used in filenames)",
