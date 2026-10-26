@@ -1,0 +1,1829 @@
+import re
+import traceback
+from datetime import date
+from io import BytesIO
+import zipfile
+
+import pandas as pd
+import streamlit as st
+from openpyxl.styles import Font, PatternFill, numbers
+from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
+
+# ============================================================
+# Yellow Cluster: Budget Summary Generator
+# - Supports selecting database type:
+#     * PPM (Aggie Enterprise / PPM export)
+#     * GL  (General Ledger export)
+# - Award Info Document is OPTIONAL (PPM only)
+# - PPM:
+#     * Automatically filters rows where Award Status, Project Status,
+#       or Task Status == "INACTIVE" (case-insensitive)
+#     * Positive financial values colored GREEN + bold in output
+#     * Negative financial values colored RED + bold in output
+# - GL:
+#     * User chooses sheet
+#     * Header row auto-detected WITHOUT needing exact header row
+#     * Column names auto-detected (keywords)
+#     * Ignores Category == "N/A" (and blanks)
+#     * Pulls Description + Financial Department
+#     * Adds Notes (blank) columns for manual entry
+#     * Output workbook (GL):
+#         - GL_Pulled_Columns_Check: ONLY pulled cols (no Notes) for verification
+#         - Pivot_By_Category:
+#           Category | Budget(blank) | Actuals | Balance (=Budget-Actuals) | Notes(blank)
+#           + totals row with SUM formulas (always sums rows above)
+#           + Balance conditional colors (green positive / red negative)
+#           + Title: "<Financial Department> Expenses"
+#         - Larger fonts + alternating light-green rows for readability
+# - UI:
+#     * If GL selected, Award uploader + indirect toggle hidden
+# ============================================================
+
+# -----------------------------
+# PAGE CONFIG (must be first Streamlit call)
+# -----------------------------
+st.set_page_config(
+    page_title="Yellow Cluster: Budget Summary Generator",
+    page_icon="🐄",
+    layout="wide",
+)
+
+# -----------------------------
+# SETTINGS
+# -----------------------------
+SUMMARY_SHEET_NAME = "Summary"
+HEADER_ROW_INDEX = 17  # 0-based index: Excel row 18 (i.e., delete first 17 rows)
+REPORT_RUNDATE_ROW0 = 2
+REPORT_RUNDATE_COL0 = 0
+
+# Optional debug toggles
+show_trace = False
+show_key_samples = False
+show_unmatched = False
+
+# PPM column identifiers
+PI_COL_NAME = "Project Principal Investigator"
+PROJECT_COL_NAME = "Project Number"
+TASK_NAME_COL_NAME = "Task Name"
+TASK_NUMBER_COL_NAME = "Task Number"
+STATUS_COL_NAME = "Project Status"
+AWARD_STATUS_COL_NAME = "Award Status"
+TASK_STATUS_COL_NAME = "Task Status"
+
+ALLOC_BUDGET_NET_COL = "Allocated Budget*"
+CURRENT_BAL_NET_COL = "Current Balance*"
+
+# GL canonical columns
+GL_COL_CATEGORY = "Category"
+GL_COL_ACTUALS = "Actuals"
+GL_COL_PERIOD = "Accounting Period"
+GL_COL_ACTIVITY = "Activity"
+GL_COL_FIN_DEPT = "Financial Department"
+GL_COL_DESC = "Description"
+
+# Color constants for financial value formatting
+COLOR_POSITIVE_GREEN = "004B00"   # dark green text
+COLOR_NEGATIVE_RED   = "8B0000"   # dark red text
+
+# 391 (Funding Entry Report) source columns
+R391_COL_FIN_DEPT_DESC = "Financial Department Description"  # AI -> no longer used or output
+R391_COL_PI = "Project Principal Investigator"                # AQ -> renamed "Principal Investigator", now first column & sort key
+R391_COL_EMP_ID = "Employee ID"                                # J
+R391_COL_EMP_NAME = "Employee Name"                            # K (note: user referenced "E", but "Employee Name"
+                                                                # actually lives in column K in this export; E is
+                                                                # "Sub Division Description". Matched by column name.)
+R391_COL_JOB_DESC = "Job Code Description"                     # N
+R391_COL_EFF_DATE = "Effective Date"                           # U
+R391_COL_EXP_END_DATE = "Expected End Date"                     # X
+R391_COL_DATE_ADDED = "Date Added"                              # AV
+R391_COL_MONTHLY_RATE = "Monthly Rate"                          # AB
+R391_COL_HOURLY_RATE = "Hourly Rate"                            # AA
+R391_COL_ANNUAL_RATE = "Annual Rate"                            # derived: Monthly Rate x 12
+R391_COL_OTC_INDC = "OTC Indc"                                  # AS
+R391_COL_DIST_PCT = "Dist Pct"                                  # AU
+R391_COL_FTE = "FTE"                                            # Y
+
+# Original raw block (Entity through Award), kept under their original header names and
+# original left-to-right order (Financial Department Description excluded), and visually set
+# apart in the output workbook
+R391_COL_ENTITY = "Entity"                                      # AF
+R391_COL_FUND = "Fund"                                          # AG
+R391_COL_FIN_DEPT = "Financial Department"                      # AH
+R391_COL_DEPT_ROLLUP = "Department Rollup"                      # AJ
+R391_COL_PURPOSE = "Purpose"                                    # AK
+R391_COL_PROGRAM = "Program"                                    # AL
+R391_COL_PROJECT = "Project"                                    # AM
+R391_COL_ACTIVITY = "Activity"                                  # AN
+R391_COL_TASK = "Task"                                          # AO
+R391_COL_AWARD = "Award"                                        # AP
+
+R391_RAW_BLOCK_COLUMNS = [
+    R391_COL_ENTITY,
+    R391_COL_FUND,
+    R391_COL_FIN_DEPT,
+    R391_COL_DEPT_ROLLUP,
+    R391_COL_PURPOSE,
+    R391_COL_PROGRAM,
+    R391_COL_PROJECT,
+    R391_COL_ACTIVITY,
+    R391_COL_TASK,
+    R391_COL_AWARD,
+]
+
+R391_COL_PI_OUTPUT = "Principal Investigator"
+
+R391_OUTPUT_COLUMNS = [
+    R391_COL_PI_OUTPUT,
+    R391_COL_EMP_ID,
+    R391_COL_EMP_NAME,
+    R391_COL_JOB_DESC,
+    R391_COL_EFF_DATE,
+    R391_COL_DATE_ADDED,      # swapped: Date Added now precedes Expected End Date
+    R391_COL_EXP_END_DATE,
+    R391_COL_HOURLY_RATE,     # swapped: Hourly Rate now precedes Monthly Rate
+    R391_COL_MONTHLY_RATE,
+    R391_COL_ANNUAL_RATE,     # derived, immediately follows Monthly Rate
+    R391_COL_OTC_INDC,
+    R391_COL_DIST_PCT,
+    R391_COL_FTE,
+] + R391_RAW_BLOCK_COLUMNS
+
+# Job Code Description contains any of these (case-insensitive substring) -> the employee is
+# PI of their own funding, so PI is forced to their own name (reformatted "First Last")
+R391_SELF_PI_KEYWORDS = {"PROF", "LECT"}
+
+# Job Code Descriptions to drop entirely from the 391 output
+R391_EXCLUDED_JOB_CODES = {"FINANCIAL ANL SUPV 1", "RSCH ADM 3 RP"}
+
+# Red-flag row highlighting rules
+R391_REDFLAG_ACTIVITY_CODES = {"990000", "990001", "990002"}
+R391_REDFLAG_PROJECT_PREFIX = "DKO"
+
+# Yellow cell highlight: Expected End Date within this many months of today (either direction)
+R391_EXPIRING_SOON_MONTHS = 2
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def normalize_columns(cols):
+    return [str(c).replace("\xa0", " ").strip() for c in cols]
+
+
+def safe_str(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, float) and pd.isna(x):
+        return ""
+    return str(x).replace("\xa0", " ").strip()
+
+
+def extract_report_run_date_from_cell(val) -> str:
+    s = safe_str(val)
+    if not s:
+        return ""
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+    return m.group(1) if m else ""
+
+
+def canon_key(x) -> str:
+    s = safe_str(x)
+    if not s:
+        return ""
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+    return re.sub(r"[^A-Za-z0-9]", "", s).upper()
+
+
+def find_column_by_exact_or_keywords(columns, target_name, keywords=None):
+    columns = list(columns)
+    if target_name in columns:
+        return target_name
+    if keywords:
+        lowered = [c.lower() for c in columns]
+        for col, low in zip(columns, lowered):
+            if all(k.lower() in low for k in keywords):
+                return col
+    raise KeyError(
+        f"Could not find a suitable column for '{target_name}'. Available columns: {columns}"
+    )
+
+
+def find_column_loose(columns, target: str):
+    """Return the first column name matching target (case-insensitive, whitespace-normalized), or None."""
+    for col in columns:
+        if safe_str(col).strip().lower() == target.strip().lower():
+            return col
+    return None
+
+
+def normalize_pi_last_first(pi_val: str) -> str:
+    s = safe_str(pi_val)
+    if not s:
+        return ""
+    if "," in s:
+        return s
+    parts = s.split()
+    if len(parts) >= 2:
+        return f"{parts[-1]}, {' '.join(parts[:-1])}"
+    return s
+
+
+def make_safe_filename_fragment(name: str) -> str:
+    frag = safe_str(name)
+    frag = re.sub(r'[\/:*?"<>|]+', "_", frag)
+    frag = frag.strip().strip(".")
+    return frag[:120] if frag else "Report"
+
+
+# -----------------------------
+# PPM: inactive-row filter
+# -----------------------------
+def filter_inactive_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove rows where ANY of Award Status, Project Status, or Task Status
+    equals 'INACTIVE' (case-insensitive).
+    Columns that are absent in the DataFrame are silently skipped.
+    """
+    status_cols_to_check = [AWARD_STATUS_COL_NAME, STATUS_COL_NAME, TASK_STATUS_COL_NAME]
+    for target in status_cols_to_check:
+        matched = find_column_loose(df.columns, target)
+        if matched:
+            df = df[~df[matched].apply(safe_str).str.upper().eq("INACTIVE")]
+    return df
+
+
+# -----------------------------
+# Formatting helpers
+# -----------------------------
+def _auto_width(ws, max_width=55, min_width=10):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            if cell.value is not None:
+                max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = max(min_width, min(max_len + 2, max_width))
+
+
+def _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=None, font_size=12):
+    """
+    - Bold header
+    - Larger fonts
+    - Alternating light-green row shading
+    - Currency formatting for specified header names
+    """
+    currency_headers = currency_headers or []
+    header_font = Font(bold=True, size=font_size + 1)
+    body_font = Font(size=font_size)
+
+    for cell in next(ws.iter_rows(min_row=header_row, max_row=header_row)):
+        cell.font = header_font
+
+    headers = [c.value for c in next(ws.iter_rows(min_row=header_row, max_row=header_row))]
+    header_to_col = {h: get_column_letter(i + 1) for i, h in enumerate(headers)}
+
+    fill_green = PatternFill(start_color="FFE6F4EA", end_color="FFE6F4EA", fill_type="solid")
+
+    for r in range(start_data_row, ws.max_row + 1):
+        for cell in ws[r]:
+            cell.font = body_font
+            if (r - start_data_row) % 2 == 1:
+                cell.fill = fill_green
+
+    for h in currency_headers:
+        if h in header_to_col:
+            col_letter = header_to_col[h]
+            for cell in ws[col_letter]:
+                if cell.row <= header_row:
+                    continue
+                cell.number_format = numbers.FORMAT_CURRENCY_USD_SIMPLE
+
+
+def _apply_financial_color_formatting(ws, financial_col_names: list, header_row: int, start_data_row: int, end_data_row: int, font_size: int = 12):
+    """
+    For each specified financial column, apply:
+      - GREEN bold text for positive values
+      - RED bold text for negative values
+    Uses openpyxl conditional formatting rules.
+    """
+    headers = [c.value for c in next(ws.iter_rows(min_row=header_row, max_row=header_row))]
+    col_map = {h: idx + 1 for idx, h in enumerate(headers)}
+
+    for col_name in financial_col_names:
+        if col_name not in col_map:
+            continue
+        col_letter = get_column_letter(col_map[col_name])
+        rng = f"{col_letter}{start_data_row}:{col_letter}{end_data_row}"
+
+        ws.conditional_formatting.add(
+            rng,
+            CellIsRule(
+                operator="greaterThan",
+                formula=["0"],
+                font=Font(color=COLOR_POSITIVE_GREEN, bold=True, size=font_size),
+            ),
+        )
+        ws.conditional_formatting.add(
+            rng,
+            CellIsRule(
+                operator="lessThan",
+                formula=["0"],
+                font=Font(color=COLOR_NEGATIVE_RED, bold=True, size=font_size),
+            ),
+        )
+
+
+# -----------------------------
+# PPM readers
+# -----------------------------
+def read_aggy_master(master_bytes: bytes):
+    df_raw = pd.read_excel(BytesIO(master_bytes), sheet_name=SUMMARY_SHEET_NAME, header=None)
+
+    report_cell = None
+    try:
+        report_cell = df_raw.iat[REPORT_RUNDATE_ROW0, REPORT_RUNDATE_COL0]
+    except Exception:
+        report_cell = None
+    report_date = extract_report_run_date_from_cell(report_cell)
+
+    header = df_raw.iloc[HEADER_ROW_INDEX]
+    df = df_raw.iloc[HEADER_ROW_INDEX + 1:].copy()
+    df.columns = header
+    df = df.dropna(how="all")
+    df.columns = normalize_columns(df.columns)
+    return df, report_date
+
+
+def read_award(award_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+    xl = pd.ExcelFile(BytesIO(award_bytes))
+    df = pd.read_excel(xl, sheet_name=sheet_name)
+    df.columns = normalize_columns(df.columns)
+    return df
+
+
+# -----------------------------
+# GL: header auto-detection
+# -----------------------------
+def normalize_header_cell(x) -> str:
+    return safe_str(x).replace("\n", " ").strip()
+
+
+def best_effort_match(col: str, required: str) -> bool:
+    c = normalize_header_cell(col).lower()
+    if not c:
+        return False
+    if c == required.lower():
+        return True
+    req_keywords = {
+        GL_COL_CATEGORY: ["category"],
+        GL_COL_ACTUALS: ["actual"],
+        GL_COL_PERIOD: ["accounting", "period"],
+        GL_COL_ACTIVITY: ["activity", "code"],
+        GL_COL_FIN_DEPT: ["financial", "department"],
+        GL_COL_DESC: ["description"],
+    }
+    kws = req_keywords.get(required, [required.lower()])
+    return all(k in c for k in kws)
+
+
+def detect_header_row_from_required_cols(raw_df: pd.DataFrame, required_cols: list, search_rows: int = 80) -> int:
+    best_row = None
+    best_score = -1
+    max_r = min(search_rows, len(raw_df))
+    for r in range(max_r):
+        headers = [normalize_header_cell(v) for v in raw_df.iloc[r].tolist()]
+        score = sum(1 for req in required_cols if any(best_effort_match(h, req) for h in headers))
+        if score > best_score:
+            best_score = score
+            best_row = r
+        if best_score == len(required_cols):
+            break
+
+    min_needed = max(1, len(required_cols) - 1)
+    if best_row is None or best_score < min_needed:
+        raise KeyError(
+            f"Could not detect a header row with at least {min_needed} of {len(required_cols)} "
+            f"required columns: {required_cols}. Tried first {max_r} rows."
+        )
+    return best_row
+
+
+def read_gl_with_auto_header(db_bytes: bytes, sheet_name: str, required_cols: list[str], search_rows: int = 80):
+    xl = pd.ExcelFile(BytesIO(db_bytes))
+    raw = pd.read_excel(xl, sheet_name=sheet_name, header=None)
+    header_row = detect_header_row_from_required_cols(raw, required_cols=required_cols, search_rows=search_rows)
+    df = pd.read_excel(xl, sheet_name=sheet_name, header=header_row)
+    df.columns = normalize_columns(df.columns)
+    return df, header_row
+
+
+# -----------------------------
+# 391 (Funding Entry Report) reader + organizer
+# -----------------------------
+def normalize_name_key(s) -> str:
+    """Lowercase, letters-and-spaces-only key for loose name matching."""
+    s = safe_str(s)
+    s = re.sub(r"[^A-Za-z\s]", "", s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+
+def match_employee_to_pi(emp_name: str, pi_lookup: dict):
+    """
+    Employee names are formatted "Last,First Middle"; PI names are formatted "First Last".
+    Try (a) full "First Middle Last" and (b) "First Last" (dropping any middle name/initial)
+    against the known-PI lookup. Returns the matched PI's original display string, or None.
+    """
+    s = safe_str(emp_name)
+    if not s or "," not in s:
+        return None
+    last_part, first_part = s.split(",", 1)
+    last_part = last_part.strip()
+    first_part = first_part.strip()
+    tokens = first_part.split()
+    if not tokens:
+        return None
+
+    candidates = [f"{first_part} {last_part}", f"{tokens[0]} {last_part}"]
+    for cand in candidates:
+        key = normalize_name_key(cand)
+        if key in pi_lookup:
+            return pi_lookup[key]
+    return None
+
+
+def format_employee_as_first_last(emp_name: str) -> str:
+    """Convert 'Last,First Middle' -> 'First Last' (drops any middle name/initial)."""
+    s = safe_str(emp_name)
+    if not s or "," not in s:
+        return s
+    last_part, first_part = s.split(",", 1)
+    last_part = last_part.strip()
+    first_part = first_part.strip()
+    tokens = first_part.split()
+    first_token = tokens[0] if tokens else first_part
+    return f"{first_token} {last_part}".strip()
+
+
+def read_391(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
+    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=0)
+    df.columns = normalize_columns(df.columns)
+    return df
+
+
+def remove_duplicate_391_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Identify rows that are 100% identical across every output column and retain only the
+    first occurrence of each. Returns a de-duplicated, index-reset DataFrame.
+    """
+    return df.drop_duplicates(keep="first").reset_index(drop=True)
+
+
+def organize_391(df: pd.DataFrame, sort_by: str = None) -> pd.DataFrame:
+    """
+    Reorganize a raw 391 export into a clean, human-readable table:
+      - "Project Principal Investigator" -> "Principal Investigator", first column
+      - Drop rows with a blank Employee ID or Employee Name
+      - Drop rows whose Job Code Description is in R391_EXCLUDED_JOB_CODES
+      - Where PI is blank, try to match the Employee Name (format "Last, First") against the
+        set of known PI names (format "First Last") in this file; if matched, fill PI with it
+      - Where Job Code Description contains "PROF" or "LECT" (case-insensitive, anywhere in the
+        string), the employee is PI of their own funding, so PI is forced to their own name
+        (reformatted "First Last"), overriding whatever the matching step produced
+      - Annual Rate = Monthly Rate x 12, whenever a Monthly Rate exists
+      - Append the original raw block of columns (Entity through Award) unchanged, in
+        their original order (see R391_RAW_BLOCK_COLUMNS)
+      - Remove exact-duplicate rows (100% identical across every output column), keeping
+        the first occurrence
+      - Sort by either Principal Investigator or Employee Name (sort_by parameter)
+      - Where the same Employee Name appears more than once with a mix of filled/blank PI,
+        move the blank-PI row(s) directly under the filled-PI row
+    """
+    sort_by = sort_by or R391_COL_PI_OUTPUT
+    sort_col = R391_COL_PI_OUTPUT if sort_by == R391_COL_PI_OUTPUT else R391_COL_EMP_NAME
+
+    required = [
+        R391_COL_PI, R391_COL_EMP_ID, R391_COL_EMP_NAME,
+        R391_COL_JOB_DESC, R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED,
+        R391_COL_MONTHLY_RATE, R391_COL_HOURLY_RATE, R391_COL_OTC_INDC, R391_COL_DIST_PCT,
+        R391_COL_FTE, R391_COL_ENTITY, R391_COL_FUND, R391_COL_FIN_DEPT, R391_COL_DEPT_ROLLUP,
+        R391_COL_PURPOSE, R391_COL_PROGRAM, R391_COL_PROJECT, R391_COL_ACTIVITY, R391_COL_TASK,
+        R391_COL_AWARD,
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"391 file is missing expected column(s): {missing}. Columns found: {list(df.columns)}")
+
+    # Build a lookup of known PI names (as they appear in this file) before any filtering,
+    # so employee-name matching has the widest possible pool of PIs to match against.
+    known_pis = [p for p in df[R391_COL_PI].apply(safe_str).unique() if p]
+    pi_lookup = {}
+    for pi in known_pis:
+        key = normalize_name_key(pi)
+        if key and key not in pi_lookup:
+            pi_lookup[key] = pi
+
+    work = df.copy()
+
+    # Remove rows with no employee attached to the funding line
+    has_emp_id = work[R391_COL_EMP_ID].apply(safe_str).ne("")
+    has_emp_name = work[R391_COL_EMP_NAME].apply(safe_str).ne("")
+    work = work[has_emp_id & has_emp_name].copy()
+
+    # Remove rows whose Job Code Description is explicitly excluded
+    job_desc_series = work[R391_COL_JOB_DESC].apply(safe_str)
+    excluded_upper = {c.upper() for c in R391_EXCLUDED_JOB_CODES}
+    work = work[~job_desc_series.str.upper().isin(excluded_upper)].copy()
+
+    pi_series = work[R391_COL_PI].apply(safe_str)
+    blank_pi_mask = pi_series.eq("")
+    matched_pi = work.loc[blank_pi_mask, R391_COL_EMP_NAME].apply(lambda nm: match_employee_to_pi(nm, pi_lookup))
+    pi_series.loc[blank_pi_mask] = matched_pi.fillna("")
+
+    # Employees whose Job Code Description contains "PROF" or "LECT" are PI of their own
+    # funding, regardless of what matching produced
+    job_desc_upper = work[R391_COL_JOB_DESC].apply(safe_str).str.upper()
+    self_pi_mask = pd.Series(False, index=work.index)
+    for keyword in R391_SELF_PI_KEYWORDS:
+        self_pi_mask = self_pi_mask | job_desc_upper.str.contains(keyword, na=False)
+    pi_series.loc[self_pi_mask] = work.loc[self_pi_mask, R391_COL_EMP_NAME].apply(format_employee_as_first_last)
+
+    work[R391_COL_PI_OUTPUT] = pi_series
+
+    # Annual Rate: Monthly Rate x 12, whenever a Monthly Rate exists
+    monthly_numeric = pd.to_numeric(work[R391_COL_MONTHLY_RATE], errors="coerce")
+    has_monthly = monthly_numeric.notna()
+    annual_rate = (monthly_numeric * 12).where(has_monthly)
+    work[R391_COL_ANNUAL_RATE] = annual_rate
+
+    df_out = work[R391_OUTPUT_COLUMNS].copy()
+    df_out = remove_duplicate_391_rows(df_out)
+
+    df_out = df_out.sort_values(
+        by=[sort_col],
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
+
+    df_out = relocate_blank_pi_duplicates(df_out)
+
+    return df_out
+
+
+def relocate_blank_pi_duplicates(df_out: pd.DataFrame) -> pd.DataFrame:
+    """
+    If the same Employee Name appears more than once and at least one of those rows has a
+    filled Principal Investigator while another has a blank one, move the blank-PI row(s) to
+    sit directly under the (first) filled-PI row for that employee. All other ordering is
+    left untouched.
+    """
+    emp_col = R391_COL_EMP_NAME
+    pi_col = R391_COL_PI_OUTPUT
+
+    work = df_out.reset_index(drop=True)
+    pi_blank = work[pi_col].apply(safe_str).eq("")
+
+    emp_counts = work[emp_col].value_counts()
+    dup_emps = emp_counts[emp_counts > 1].index
+
+    anchor_for_emp = {}
+    blanks_for_emp = {}
+    move_mask = pd.Series(False, index=work.index)
+
+    for emp in dup_emps:
+        emp_positions = work.index[work[emp_col] == emp]
+        has_filled = (~pi_blank.loc[emp_positions]).any()
+        has_blank = pi_blank.loc[emp_positions].any()
+        if has_filled and has_blank:
+            filled_positions = [p for p in emp_positions if not pi_blank.loc[p]]
+            blank_positions = [p for p in emp_positions if pi_blank.loc[p]]
+            anchor_for_emp[emp] = filled_positions[0]
+            blanks_for_emp[emp] = blank_positions
+            for p in blank_positions:
+                move_mask.loc[p] = True
+
+    new_rows = []
+    for pos in work.index:
+        if move_mask.loc[pos]:
+            continue
+        new_rows.append(work.loc[pos])
+        for emp, anchor_pos in anchor_for_emp.items():
+            if anchor_pos == pos:
+                for blank_pos in blanks_for_emp[emp]:
+                    new_rows.append(work.loc[blank_pos])
+
+    return pd.DataFrame(new_rows).reset_index(drop=True)
+
+
+def build_391_excel(df_out: pd.DataFrame) -> bytes:
+    date_cols = [R391_COL_EFF_DATE, R391_COL_EXP_END_DATE, R391_COL_DATE_ADDED]
+    currency_cols = [R391_COL_HOURLY_RATE, R391_COL_MONTHLY_RATE, R391_COL_ANNUAL_RATE]
+
+    xbuf = BytesIO()
+    with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
+        df_out.to_excel(writer, index=False, sheet_name="391 Organized")
+        wb = writer.book
+        ws = wb["391 Organized"]
+
+        _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=11)
+
+        headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        col_map = {h: idx + 1 for idx, h in enumerate(headers)}
+        for h in date_cols:
+            if h in col_map:
+                col_letter = get_column_letter(col_map[h])
+                for cell in ws[col_letter]:
+                    if cell.row <= 1:
+                        continue
+                    cell.number_format = "MM/DD/YYYY"
+
+        if R391_COL_FTE in col_map:
+            fte_letter = get_column_letter(col_map[R391_COL_FTE])
+            for cell in ws[fte_letter]:
+                if cell.row <= 1:
+                    continue
+                cell.number_format = "0.00"
+
+        # Visually set apart the original raw block (Entity ... Award) from the curated columns
+        raw_block_header_fill = PatternFill(start_color="FFD9E2F3", end_color="FFD9E2F3", fill_type="solid")
+        raw_block_body_fill = PatternFill(start_color="FFEFF3FA", end_color="FFEFF3FA", fill_type="solid")
+        for h in R391_RAW_BLOCK_COLUMNS:
+            if h not in col_map:
+                continue
+            col_letter = get_column_letter(col_map[h])
+            ws[f"{col_letter}1"].fill = raw_block_header_fill
+            for r in range(2, ws.max_row + 1):
+                ws[f"{col_letter}{r}"].fill = raw_block_body_fill
+
+        last_row = ws.max_row
+        last_col_letter = get_column_letter(ws.max_column)
+
+        # Yellow: Expected End Date is upcoming within R391_EXPIRING_SOON_MONTHS months,
+        # OR the date is any time in the past (no lower bound)
+        if R391_COL_EXP_END_DATE in col_map and last_row >= 2:
+            exp_col_letter = get_column_letter(col_map[R391_COL_EXP_END_DATE])
+            yellow_fill = PatternFill(start_color="FFFFF3B0", end_color="FFFFF3B0", fill_type="solid")
+            yellow_formula = (
+                f'AND({exp_col_letter}2<>"",'
+                f'{exp_col_letter}2<=EDATE(TODAY(),{R391_EXPIRING_SOON_MONTHS}))'
+            )
+            ws.conditional_formatting.add(
+                f"{exp_col_letter}2:{exp_col_letter}{last_row}",
+                FormulaRule(formula=[yellow_formula], fill=yellow_fill, stopIfTrue=False),
+            )
+
+        # Red: entire row when Activity is 990000/990001/990002, or Project starts with "DKO"
+        if R391_COL_ACTIVITY in col_map and R391_COL_PROJECT in col_map and last_row >= 2:
+            act_col_letter = get_column_letter(col_map[R391_COL_ACTIVITY])
+            proj_col_letter = get_column_letter(col_map[R391_COL_PROJECT])
+            red_fill = PatternFill(start_color="FFF5C6CB", end_color="FFF5C6CB", fill_type="solid")
+            red_codes = ",".join(f"${act_col_letter}2={code}" for code in sorted(R391_REDFLAG_ACTIVITY_CODES))
+            red_formula = (
+                f'OR({red_codes},'
+                f'LEFT(${proj_col_letter}2,{len(R391_REDFLAG_PROJECT_PREFIX)})="{R391_REDFLAG_PROJECT_PREFIX}")'
+            )
+            # Added first so it takes visual precedence over the yellow cell-level highlight on overlap
+            ws.conditional_formatting.add(
+                f"A2:{last_col_letter}{last_row}",
+                FormulaRule(formula=[red_formula], fill=red_fill, stopIfTrue=False),
+            )
+
+        # Freeze the header row and the first four columns (Principal Investigator, Employee ID,
+        # Employee Name, Job Code Description)
+        ws.freeze_panes = "E2"
+
+        _auto_width(ws)
+
+        # Legend sheet documenting the color-coding rules directly in the workbook
+        legend_ws = wb.create_sheet("Legend")
+        legend_ws["A1"] = "391 Organized — Legend"
+        legend_ws["A1"].font = Font(bold=True, size=13)
+
+        legend_rows = [
+            ("", ""),
+            ("Shaded blue-gray columns", "Original 391 export columns (Entity through Award), unmodified, kept together for reference."),
+            ("", ""),
+            ("Yellow cell", f"Expected End Date is within {R391_EXPIRING_SOON_MONTHS} months from now, OR is any date already in the past — funding is ending soon or has already ended."),
+            ("", ""),
+            (
+                "Red row",
+                "Activity is 990000, 990001, or 990002, OR Project begins with \"DKO\" — flagged for review.",
+            ),
+            ("", ""),
+            ("Duplicate rows", "Rows that were 100% identical across every column were removed, keeping only the first occurrence."),
+            ("", ""),
+            ("Annual Rate", "Monthly Rate x 12, whenever a Monthly Rate exists."),
+            ("", ""),
+            ("Principal Investigator", "Set to the employee's own name (reversed to \"First Last\") whenever Job Code Description contains \"PROF\" or \"LECT\"."),
+        ]
+        r = 3
+        for label, desc in legend_rows:
+            legend_ws[f"A{r}"] = label
+            legend_ws[f"A{r}"].font = Font(bold=True)
+            legend_ws[f"B{r}"] = desc
+            legend_ws[f"B{r}"].alignment = legend_ws[f"B{r}"].alignment.copy(wrap_text=True)
+            r += 1
+
+        legend_ws["A6"].fill = PatternFill(start_color="FFFFF3B0", end_color="FFFFF3B0", fill_type="solid")
+        legend_ws["A8"].fill = PatternFill(start_color="FFF5C6CB", end_color="FFF5C6CB", fill_type="solid")
+        legend_ws["A4"].fill = raw_block_header_fill
+
+        legend_ws.column_dimensions["A"].width = 24
+        legend_ws.column_dimensions["B"].width = 90
+
+    xbuf.seek(0)
+    return xbuf.getvalue()
+
+
+# -----------------------------
+# PPM output builder (ZIP per PI)
+# -----------------------------
+def build_pi_zip(df_out: pd.DataFrame, pi_col: str, hide_indirect: bool, report_label: str) -> bytes:
+    df_out = df_out.copy()
+    df_out[pi_col] = df_out[pi_col].apply(normalize_pi_last_first)
+
+    unique_pis = [p for p in df_out[pi_col].dropna().unique().tolist() if safe_str(p)]
+    unique_pis_sorted = sorted(unique_pis, key=lambda s: safe_str(s).lower())
+
+    applied_indirects = False
+    if "Indirect Rate" in df_out.columns:
+        try:
+            applied_indirects = pd.to_numeric(df_out["Indirect Rate"], errors="coerce").fillna(0).abs().gt(0).any()
+        except Exception:
+            applied_indirects = False
+
+    footnote = (
+        "* Calculated minus the indirect costs, if applicable."
+    )
+
+    # Financial columns that receive positive/negative color formatting
+    financial_color_cols = [ALLOC_BUDGET_NET_COL, CURRENT_BAL_NET_COL, "expenses"]
+
+    zip_buf = BytesIO()
+    used_names = set()
+
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for pi in unique_pis_sorted:
+            group = df_out[df_out[pi_col] == pi].copy()
+            if group.empty:
+                continue
+
+            if ALLOC_BUDGET_NET_COL in group.columns:
+                group[ALLOC_BUDGET_NET_COL] = pd.to_numeric(group[ALLOC_BUDGET_NET_COL], errors="coerce")
+                group = group.sort_values(by=ALLOC_BUDGET_NET_COL, ascending=False, na_position="last")
+
+            currency_cols = [c for c in financial_color_cols if c in group.columns]
+
+            xbuf = BytesIO()
+            with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+                group.to_excel(writer, index=False, sheet_name="Budget Summary")
+                wb = writer.book
+                ws = wb["Budget Summary"]
+
+                _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=12)
+
+                # Apply green/red bold color formatting to financial columns
+                data_end_row = ws.max_row
+                if data_end_row >= 2:
+                    _apply_financial_color_formatting(
+                        ws,
+                        financial_col_names=currency_cols,
+                        header_row=1,
+                        start_data_row=2,
+                        end_data_row=data_end_row,
+                        font_size=12,
+                    )
+
+                if hide_indirect and "Indirect Rate" in group.columns:
+                    headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+                    if "Indirect Rate" in headers:
+                        idx = headers.index("Indirect Rate") + 1
+                        ws.column_dimensions[get_column_letter(idx)].hidden = True
+
+                _auto_width(ws)
+
+                footer_row = ws.max_row + 2
+                ws[f"A{footer_row}"] = footnote
+                ws[f"A{footer_row}"].font = Font(italic=True, size=11)
+
+            xbuf.seek(0)
+
+            safe_pi = make_safe_filename_fragment(pi)
+            filename = f"{report_label} - {safe_pi}.xlsx"
+
+            if filename in used_names:
+                k = 2
+                while True:
+                    candidate = f"{report_label} - {safe_pi} ({k}).xlsx"
+                    if candidate not in used_names:
+                        filename = candidate
+                        break
+                    k += 1
+            used_names.add(filename)
+
+            zf.writestr(filename, xbuf.read())
+
+    zip_buf.seek(0)
+    return zip_buf.getvalue()
+
+
+# -----------------------------
+# GL output builder
+# -----------------------------
+def build_gl_excel(df_subset: pd.DataFrame, pivot_categories_actuals: pd.DataFrame, dept_name: str) -> bytes:
+    dept_name_clean = safe_str(dept_name) or "Financial Department"
+    title = f"{dept_name_clean} Expenses"
+
+    check_cols = [GL_COL_CATEGORY, GL_COL_ACTUALS, GL_COL_PERIOD, GL_COL_ACTIVITY, GL_COL_FIN_DEPT, GL_COL_DESC]
+    df_check = df_subset[[c for c in check_cols if c in df_subset.columns]].copy()
+
+    piv = pivot_categories_actuals.copy()
+    piv = piv.rename(columns={GL_COL_ACTUALS: "Actuals"})
+    piv = piv.sort_values(by="Actuals", ascending=False, na_position="last")
+
+    piv.insert(1, "Budget", "")
+    piv["Balance"] = ""
+    piv["Notes"] = ""
+
+    xbuf = BytesIO()
+    with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+        df_check.to_excel(writer, index=False, sheet_name="GL_Pulled_Columns_Check")
+        piv.to_excel(writer, index=False, sheet_name="Pivot_By_Category")
+
+        wb = writer.book
+
+        ws_chk = wb["GL_Pulled_Columns_Check"]
+        _style_table_sheet(ws_chk, header_row=1, start_data_row=2, currency_headers=[GL_COL_ACTUALS], font_size=12)
+        _auto_width(ws_chk)
+
+        ws_piv = wb["Pivot_By_Category"]
+
+        ws_piv.insert_rows(1)
+        ws_piv["A1"] = title
+        ws_piv["A1"].font = Font(bold=True, size=14)
+
+        _style_table_sheet(ws_piv, header_row=2, start_data_row=3, currency_headers=["Budget", "Actuals", "Balance"], font_size=12)
+
+        headers = [c.value for c in next(ws_piv.iter_rows(min_row=2, max_row=2))]
+        col_map = {name: idx + 1 for idx, name in enumerate(headers)}
+
+        data_start = 3
+        data_end = ws_piv.max_row
+
+        b_col = col_map.get("Budget")
+        a_col = col_map.get("Actuals")
+        bal_col = col_map.get("Balance")
+
+        if b_col and a_col and bal_col:
+            for r in range(data_start, data_end + 1):
+                b_cell = ws_piv.cell(row=r, column=b_col).coordinate
+                a_cell = ws_piv.cell(row=r, column=a_col).coordinate
+                ws_piv.cell(row=r, column=bal_col).value = f"={b_cell}-{a_cell}"
+
+            bal_letter = get_column_letter(bal_col)
+            rng = f"{bal_letter}{data_start}:{bal_letter}{data_end}"
+            ws_piv.conditional_formatting.add(
+                rng,
+                CellIsRule(operator="greaterThan", formula=["0"], font=Font(color=COLOR_POSITIVE_GREEN, bold=True)),
+            )
+            ws_piv.conditional_formatting.add(
+                rng,
+                CellIsRule(operator="lessThan", formula=["0"], font=Font(color=COLOR_NEGATIVE_RED, bold=True)),
+            )
+
+        total_row = ws_piv.max_row + 1
+        ws_piv.cell(row=total_row, column=col_map["Category"]).value = "TOTAL"
+
+        def set_sum_total(col_name: str):
+            if col_name not in col_map:
+                return
+            c = col_map[col_name]
+            col_letter = get_column_letter(c)
+            ws_piv.cell(row=total_row, column=c).value = f"=SUM({col_letter}{data_start}:{col_letter}{data_end})"
+            ws_piv.cell(row=total_row, column=c).number_format = numbers.FORMAT_CURRENCY_USD_SIMPLE
+
+        set_sum_total("Budget")
+        set_sum_total("Actuals")
+        set_sum_total("Balance")
+
+        fill = PatternFill(start_color="FFFAD7", end_color="FFFAD7", fill_type="solid")
+        for cell in ws_piv[total_row]:
+            cell.font = Font(bold=True, size=13)
+            cell.fill = fill
+
+        _auto_width(ws_piv)
+
+    xbuf.seek(0)
+    return xbuf.getvalue()
+
+
+# -----------------------------
+# GLIDE & Project Costs
+# -----------------------------
+GLIDE_PROJECT_COL_CANDIDATES = ["PPM Project", "GL Project"]
+GLIDE_PROJECT_NAME_COL_CANDIDATES = ["PPM Project Name", "GL Project Name"]
+
+GLIDE_COL_ACCOUNTING_DATE = "Accounting Date"
+GLIDE_COL_DEBIT_AMOUNT = "Debit Amount"
+GLIDE_COL_EXP_TYPE_NAME = "PPM Expenditure Type Name"
+GLIDE_COL_DESCRIPTION = "Description"
+GLIDE_COL_TASK = "PPM Task"
+GLIDE_COL_UDF2 = "udfString2"
+GLIDE_COL_UDF4 = "udfString4"
+GLIDE_COL_UDF5 = "udfString5"
+
+# Display names for the udfString columns in the organized output
+GLIDE_UDF_RENAME_MAP = {
+    GLIDE_COL_UDF2: "Description_1",
+    GLIDE_COL_UDF4: "Description_2",
+    GLIDE_COL_UDF5: "Description_3",
+}
+
+GLIDE_FIXED_COLUMNS = [
+    GLIDE_COL_ACCOUNTING_DATE,
+    GLIDE_COL_DEBIT_AMOUNT,
+    GLIDE_COL_EXP_TYPE_NAME,
+    GLIDE_COL_DESCRIPTION,
+    GLIDE_COL_UDF2,
+    GLIDE_COL_UDF4,
+    GLIDE_COL_UDF5,
+]
+
+
+def detect_glide_project_columns(df: pd.DataFrame):
+    """
+    Returns (project_col, project_name_col) using whichever pair is present:
+    "PPM Project"/"PPM Project Name", or "GL Project"/"GL Project Name".
+    """
+    for proj_candidate, name_candidate in zip(GLIDE_PROJECT_COL_CANDIDATES, GLIDE_PROJECT_NAME_COL_CANDIDATES):
+        if proj_candidate in df.columns and name_candidate in df.columns:
+            return proj_candidate, name_candidate
+
+    # Fall back to a mixed match in case only one half is present under each label
+    proj_col = next((c for c in GLIDE_PROJECT_COL_CANDIDATES if c in df.columns), None)
+    name_col = next((c for c in GLIDE_PROJECT_NAME_COL_CANDIDATES if c in df.columns), None)
+    if proj_col and name_col:
+        return proj_col, name_col
+
+    raise KeyError(
+        "GLIDE file must contain either 'PPM Project'/'PPM Project Name' or "
+        "'GL Project'/'GL Project Name' columns. Columns found: " + str(list(df.columns))
+    )
+
+
+def read_glide(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
+    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=0)
+    df.columns = normalize_columns(df.columns)
+    return df
+
+
+def organize_glide(df: pd.DataFrame):
+    """
+    Reorganize a raw GLIDE export into a clean, human-readable table:
+      - Detects whether the file uses "PPM Project"/"PPM Project Name" or
+        "GL Project"/"GL Project Name" and keeps that pair; "PPM Task" is inserted
+        immediately after the project column
+      - Retains: PPM Task, Accounting Date, Debit Amount, PPM Expenditure Type Name,
+        Description, udfString2, udfString4, udfString5 (renamed to Description_1/2/3)
+      - Sorts by project number, then Accounting Date
+    Returns (df_out, project_col, project_name_col).
+    """
+    proj_col, proj_name_col = detect_glide_project_columns(df)
+
+    required = GLIDE_FIXED_COLUMNS + [GLIDE_COL_TASK]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"GLIDE file is missing expected column(s): {missing}. Columns found: {list(df.columns)}")
+
+    output_columns = [proj_col, GLIDE_COL_TASK, proj_name_col] + GLIDE_FIXED_COLUMNS
+    df_out = df[output_columns].copy()
+    df_out = df_out.rename(columns=GLIDE_UDF_RENAME_MAP)
+
+    df_out = df_out.sort_values(
+        by=[proj_col, GLIDE_COL_ACCOUNTING_DATE],
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
+
+    return df_out, proj_col, proj_name_col
+
+
+def _style_glide_sheet(ws, proj_col, currency_cols):
+    _style_table_sheet(ws, header_row=1, start_data_row=2, currency_headers=currency_cols, font_size=11)
+
+    headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    col_map = {h: idx + 1 for idx, h in enumerate(headers)}
+    if GLIDE_COL_ACCOUNTING_DATE in col_map:
+        col_letter = get_column_letter(col_map[GLIDE_COL_ACCOUNTING_DATE])
+        for cell in ws[col_letter]:
+            if cell.row <= 1:
+                continue
+            cell.number_format = "MM/DD/YYYY"
+
+    ws.freeze_panes = "A2"
+    _auto_width(ws)
+
+
+def build_glide_master_excel(df_out: pd.DataFrame, proj_col: str) -> bytes:
+    xbuf = BytesIO()
+    with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
+        df_out.to_excel(writer, index=False, sheet_name="GLIDE Master")
+        ws = writer.book["GLIDE Master"]
+        _style_glide_sheet(ws, proj_col, currency_cols=[GLIDE_COL_DEBIT_AMOUNT])
+    xbuf.seek(0)
+    return xbuf.getvalue()
+
+
+def build_glide_project_zip(df_out: pd.DataFrame, proj_col: str, report_label: str) -> bytes:
+    unique_projects = [p for p in df_out[proj_col].apply(safe_str).unique().tolist() if p]
+    unique_projects_sorted = sorted(unique_projects, key=lambda s: s.lower())
+
+    zip_buf = BytesIO()
+    used_names = set()
+
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for proj in unique_projects_sorted:
+            group = df_out[df_out[proj_col].apply(safe_str) == proj].copy()
+            if group.empty:
+                continue
+
+            xbuf = BytesIO()
+            with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
+                group.to_excel(writer, index=False, sheet_name="Project Costs")
+                ws = writer.book["Project Costs"]
+                _style_glide_sheet(ws, proj_col, currency_cols=[GLIDE_COL_DEBIT_AMOUNT])
+            xbuf.seek(0)
+
+            safe_proj = make_safe_filename_fragment(proj)
+            filename = f"{report_label} - {safe_proj}.xlsx"
+            if filename in used_names:
+                k = 2
+                while True:
+                    candidate = f"{report_label} - {safe_proj} ({k}).xlsx"
+                    if candidate not in used_names:
+                        filename = candidate
+                        break
+                    k += 1
+            used_names.add(filename)
+
+            zf.writestr(filename, xbuf.read())
+
+    zip_buf.seek(0)
+    return zip_buf.getvalue()
+
+
+# -----------------------------
+# 339 Pivot Generator
+# -----------------------------
+R339_COL_PROJECT = "Project"
+R339_COL_ACTIVITY = "Activity"
+R339_COL_TASK = "Task"
+R339_COL_EMP_NAME = "Employee Name"
+R339_COL_EMP_ID = "Employee ID"
+R339_COL_JOB_CODE = "Job Code"
+R339_COL_UC_EARN_DATE = "UC Earn End Date"  # closest match to the requested "UC Earn Date";
+                                             # this source file has no column named exactly "UC Earn Date"
+R339_COL_MONTHLY_RATE = "Monthly Rate"
+R339_COL_EXPENSE_TYPE = "Expense Type"
+R339_COL_MONETARY_AMOUNT = "Monetary Amount"
+
+R339_OUTPUT_COLUMNS = [
+    R339_COL_PROJECT,
+    R339_COL_ACTIVITY,
+    R339_COL_TASK,
+    R339_COL_EMP_NAME,
+    R339_COL_EMP_ID,
+    R339_COL_JOB_CODE,
+    R339_COL_UC_EARN_DATE,
+    R339_COL_MONTHLY_RATE,
+    R339_COL_EXPENSE_TYPE,
+    R339_COL_MONETARY_AMOUNT,
+]
+
+R339_SORT_BY_PROJECT = "Project"
+R339_SORT_BY_EMPLOYEE = "Employee Name"
+
+
+def read_339(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
+    df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, header=0)
+    df.columns = normalize_columns(df.columns)
+    return df
+
+
+def organize_339(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim a raw 339 export down to just the columns this module works with."""
+    missing = [c for c in R339_OUTPUT_COLUMNS if c not in df.columns]
+    if missing:
+        raise KeyError(f"339 file is missing expected column(s): {missing}. Columns found: {list(df.columns)}")
+    return df[R339_OUTPUT_COLUMNS].copy()
+
+
+def filter_339_date_range(df_out: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
+    dates = pd.to_datetime(df_out[R339_COL_UC_EARN_DATE], errors="coerce")
+    mask = dates.notna() & (dates >= pd.Timestamp(start_date)) & (dates <= pd.Timestamp(end_date))
+    return df_out[mask].copy()
+
+
+def build_339_group_excel(group_df: pd.DataFrame, row_fields: list) -> bytes:
+    """
+    Build a two-sheet workbook for one group (one Project, or one Employee):
+      Sheet 1 "Pivot" - Monetary Amount summed, columns = UC Earn End Date, rows = row_fields
+      Sheet 2 "Data"  - the underlying trimmed/filtered rows for this group
+    """
+    pivot = pd.pivot_table(
+        group_df,
+        values=R339_COL_MONETARY_AMOUNT,
+        index=row_fields,
+        columns=R339_COL_UC_EARN_DATE,
+        aggfunc="sum",
+        fill_value=0,
+    )
+    pivot.columns = [
+        c.strftime("%m/%d/%Y") if isinstance(c, pd.Timestamp) else safe_str(c) for c in pivot.columns
+    ]
+    pivot = pivot.reset_index()
+    date_col_headers = [c for c in pivot.columns if c not in row_fields]
+
+    xbuf = BytesIO()
+    with pd.ExcelWriter(xbuf, engine="openpyxl", date_format="MM/DD/YYYY") as writer:
+        pivot.to_excel(writer, index=False, sheet_name="Pivot")
+        group_df.to_excel(writer, index=False, sheet_name="Data")
+        wb = writer.book
+
+        ws_pivot = wb["Pivot"]
+        _style_table_sheet(ws_pivot, header_row=1, start_data_row=2, currency_headers=date_col_headers, font_size=11)
+        ws_pivot.freeze_panes = get_column_letter(len(row_fields) + 1) + "2"
+        _auto_width(ws_pivot)
+
+        ws_data = wb["Data"]
+        _style_table_sheet(
+            ws_data, header_row=1, start_data_row=2,
+            currency_headers=[R339_COL_MONTHLY_RATE, R339_COL_MONETARY_AMOUNT], font_size=11,
+        )
+        headers = [c.value for c in next(ws_data.iter_rows(min_row=1, max_row=1))]
+        col_map = {h: idx + 1 for idx, h in enumerate(headers)}
+        if R339_COL_UC_EARN_DATE in col_map:
+            col_letter = get_column_letter(col_map[R339_COL_UC_EARN_DATE])
+            for cell in ws_data[col_letter]:
+                if cell.row <= 1:
+                    continue
+                cell.number_format = "MM/DD/YYYY"
+        ws_data.freeze_panes = "A2"
+        _auto_width(ws_data)
+
+    xbuf.seek(0)
+    return xbuf.getvalue()
+
+
+def build_339_zip(df_filtered: pd.DataFrame, split_col: str, row_fields: list, date_label: str) -> bytes:
+    groups = [g for g in df_filtered[split_col].apply(safe_str).unique().tolist() if g]
+    groups_sorted = sorted(groups, key=lambda s: s.lower())
+
+    zip_buf = BytesIO()
+    used_names = set()
+
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for group_val in groups_sorted:
+            group_df = df_filtered[df_filtered[split_col].apply(safe_str) == group_val].copy()
+            if group_df.empty:
+                continue
+
+            xbytes = build_339_group_excel(group_df, row_fields)
+
+            safe_group = make_safe_filename_fragment(group_val)
+            filename = f"339_{safe_group}_{date_label}.xlsx"
+            if filename in used_names:
+                k = 2
+                while True:
+                    candidate = f"339_{safe_group}_{date_label} ({k}).xlsx"
+                    if candidate not in used_names:
+                        filename = candidate
+                        break
+                    k += 1
+            used_names.add(filename)
+
+            zf.writestr(filename, xbytes)
+
+    zip_buf.seek(0)
+    return zip_buf.getvalue()
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.markdown(
+    """
+    <div style="padding: 0.85rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 0.75rem;">
+      <div style="font-size: 1.25rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
+      <div style="opacity: 0.85; margin-top: 0.15rem; font-size: 0.9rem;">
+        Generate PI-level budget reports from a PPM (Aggie Enterprise) export, or build a GL expenses table.
+        &nbsp;·&nbsp; Bugs to David Railton Garrett — drgarrett@ucdavis.edu
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+PPM_OPTION = "PPM (Monthly Budget)"
+GL_OPTION = "GL (YTD Expense Table)"
+R391_OPTION = "391 (Funding Entry Report)"
+GLIDE_OPTION = "GLIDE & Project Costs"
+R339_OPTION = "339 Pivot Generator"
+
+# -----------------------------
+# Sidebar: setup / inputs
+# -----------------------------
+with st.sidebar:
+    st.markdown("#### Setup")
+    db_type = st.radio(
+        "Database type",
+        options=[PPM_OPTION, GL_OPTION, R391_OPTION, GLIDE_OPTION, R339_OPTION],
+        index=0,
+        help=(
+            "PPM = Aggie Enterprise (PPM export). GL = General Ledger export. "
+            "391 = UCPath Funding Entry Report. GLIDE = GLIDE transaction export. "
+            "339 = Distribution of Payroll Expense Report."
+        ),
+    )
+    uploader_labels = {
+        PPM_OPTION: "PPM database (.xlsx)",
+        GL_OPTION: "GL database (.xlsx)",
+        R391_OPTION: "391 database (.xlsx)",
+        GLIDE_OPTION: "GLIDE database (.xlsx)",
+        R339_OPTION: "339 database (.xlsx)",
+    }
+    db_file = st.file_uploader(uploader_labels[db_type], type=["xlsx"])
+
+    award_file = None
+    hide_indirect_in_output = True
+    if db_type == PPM_OPTION:
+        st.markdown("#### Award Info (optional)")
+        award_file = st.file_uploader("Award Info document (.xlsx)", type=["xlsx"])
+        hide_indirect_in_output = st.checkbox("Hide 'Indirect Rate' column in output", value=True)
+
+    if db_type == R391_OPTION:
+        st.markdown("#### Sort")
+        r391_sort_choice = st.radio(
+            "Sort by",
+            options=["Principal Investigator", "Employee Name"],
+            index=0,
+        )
+
+    if db_type == R339_OPTION:
+        st.markdown("#### Sort")
+        r339_sort_choice = st.radio(
+            "Sort by",
+            options=[R339_SORT_BY_PROJECT, R339_SORT_BY_EMPLOYEE],
+            index=0,
+        )
+
+if not db_file:
+    st.info(
+        "Choose PPM, GL, 391, GLIDE, or 339 in the sidebar, then upload the corresponding database file. "
+        "Award Info is only available in PPM mode."
+    )
+    st.stop()
+
+try:
+    db_bytes = db_file.getvalue()
+
+    # ============================================================
+    # 339 PIVOT GENERATOR MODE
+    # ============================================================
+    if db_type == R339_OPTION:
+        xl_339 = pd.ExcelFile(BytesIO(db_bytes))
+        sheet_339 = xl_339.sheet_names[0]
+        if len(xl_339.sheet_names) > 1:
+            sheet_339 = st.selectbox("339 sheet to use", options=xl_339.sheet_names, index=0)
+
+        df_339_raw = read_339(db_bytes, sheet_name=sheet_339)
+        df_339_trimmed = organize_339(df_339_raw)
+
+        earn_dates = pd.to_datetime(df_339_trimmed[R339_COL_UC_EARN_DATE], errors="coerce").dropna()
+        if earn_dates.empty:
+            st.error(f"No usable dates found in '{R339_COL_UC_EARN_DATE}'.")
+            st.stop()
+
+        data_min_date = earn_dates.min().date()
+        data_max_date = earn_dates.max().date()
+        default_start = max(data_min_date, (pd.Timestamp(data_max_date) - pd.DateOffset(months=6)).date())
+
+        st.markdown("#### Date range (UC Earn End Date)")
+        date_range = st.date_input(
+            "Select range",
+            value=(default_start, data_max_date),
+            min_value=data_min_date,
+            max_value=data_max_date,
+        )
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            range_start, range_end = date_range
+        else:
+            # user has only picked one endpoint so far
+            range_start, range_end = default_start, data_max_date
+
+        df_339_filtered = filter_339_date_range(df_339_trimmed, range_start, range_end)
+
+        if r339_sort_choice == R339_SORT_BY_PROJECT:
+            split_col = R339_COL_PROJECT
+            row_fields = [R339_COL_EMP_NAME, R339_COL_EXPENSE_TYPE]
+        else:
+            split_col = R339_COL_EMP_NAME
+            row_fields = [R339_COL_PROJECT, R339_COL_EXPENSE_TYPE]
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Rows in range", len(df_339_filtered))
+        m2.metric("Unique Projects", df_339_filtered[R339_COL_PROJECT].apply(safe_str).nunique())
+        m3.metric("Unique Employees", df_339_filtered[R339_COL_EMP_NAME].apply(safe_str).nunique())
+        m4.metric(
+            "Total Monetary Amount",
+            f"${pd.to_numeric(df_339_filtered[R339_COL_MONETARY_AMOUNT], errors='coerce').fillna(0).sum():,.2f}",
+        )
+
+        st.caption(
+            f"Splitting into one file per **{split_col}**, with pivot rows "
+            f"**{row_fields[0]}** then **{row_fields[1]}**, columns = {R339_COL_UC_EARN_DATE}, "
+            f"values = sum of {R339_COL_MONETARY_AMOUNT}."
+        )
+
+        st.dataframe(df_339_filtered, use_container_width=True, height=480)
+
+        date_label = st.text_input(
+            "Download date (used in filenames)",
+            value=date.today().strftime("%Y-%m-%d"),
+        )
+
+        if st.button("Generate ZIP (one Excel per " + split_col + ")", type="primary", use_container_width=True):
+            zip_bytes = build_339_zip(df_339_filtered, split_col, row_fields, date_label)
+            st.success("ZIP generated!")
+            st.download_button(
+                "Download ZIP (339 Pivot files)",
+                data=zip_bytes,
+                file_name=f"339_Pivot_{make_safe_filename_fragment(date_label)}.zip",
+                mime="application/zip",
+            )
+
+        st.stop()
+
+    # ============================================================
+    # GLIDE & PROJECT COSTS MODE
+    # ============================================================
+    if db_type == GLIDE_OPTION:
+        xl_glide = pd.ExcelFile(BytesIO(db_bytes))
+        sheet_glide = xl_glide.sheet_names[0]
+        if len(xl_glide.sheet_names) > 1:
+            sheet_glide = st.selectbox("GLIDE sheet to use", options=xl_glide.sheet_names, index=0)
+
+        df_glide_raw = read_glide(db_bytes, sheet_name=sheet_glide)
+        df_glide_out, glide_proj_col, glide_proj_name_col = organize_glide(df_glide_raw)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Transactions", len(df_glide_out))
+        m2.metric("Unique Projects", df_glide_out[glide_proj_col].apply(safe_str).nunique())
+        m3.metric("Total Debit Amount", f"${pd.to_numeric(df_glide_out[GLIDE_COL_DEBIT_AMOUNT], errors='coerce').fillna(0).sum():,.2f}")
+
+        st.caption(
+            f"Detected project columns: **{glide_proj_col}** / **{glide_proj_name_col}**. "
+            f"Sorted by {glide_proj_col}, then {GLIDE_COL_ACCOUNTING_DATE}."
+        )
+
+        st.dataframe(df_glide_out, use_container_width=True, height=480)
+
+        glide_report_label = st.text_input(
+            "Report label (used in filenames)",
+            value=f"GLIDE_Project_Costs_{date.today().strftime('%Y-%m-%d')}",
+        )
+
+        gc1, gc2 = st.columns(2)
+        with gc1:
+            if st.button("Generate Master Excel", type="primary", use_container_width=True):
+                master_bytes = build_glide_master_excel(df_glide_out, glide_proj_col)
+                st.success("Master Excel generated!")
+                st.download_button(
+                    "Download Master Excel",
+                    data=master_bytes,
+                    file_name=f"{make_safe_filename_fragment(glide_report_label)} - Master.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+        with gc2:
+            if st.button("Generate ZIP (one Excel per Project)", type="primary", use_container_width=True):
+                zip_bytes = build_glide_project_zip(df_glide_out, glide_proj_col, glide_report_label)
+                st.success("ZIP generated!")
+                st.download_button(
+                    "Download ZIP (Project files)",
+                    data=zip_bytes,
+                    file_name=f"{make_safe_filename_fragment(glide_report_label)} - Project Files.zip",
+                    mime="application/zip",
+                )
+
+        st.stop()
+
+    # ============================================================
+    # 391 MODE
+    # ============================================================
+    if db_type == R391_OPTION:
+        xl_391 = pd.ExcelFile(BytesIO(db_bytes))
+        sheet_391 = xl_391.sheet_names[0]
+        if len(xl_391.sheet_names) > 1:
+            sheet_391 = st.selectbox("391 sheet to use", options=xl_391.sheet_names, index=0)
+
+        df_391_raw = read_391(db_bytes, sheet_name=sheet_391)
+        df_391_out = organize_391(df_391_raw, sort_by=r391_sort_choice)
+
+        _work_check = df_391_raw.copy()
+        _has_id = _work_check[R391_COL_EMP_ID].apply(safe_str).ne("")
+        _has_name = _work_check[R391_COL_EMP_NAME].apply(safe_str).ne("")
+        _rows_no_employee = int((~(_has_id & _has_name)).sum())
+        _work_check = _work_check[_has_id & _has_name]
+
+        _job_desc = _work_check[R391_COL_JOB_DESC].apply(safe_str)
+        _excluded_upper = {c.upper() for c in R391_EXCLUDED_JOB_CODES}
+        _rows_excluded_job_code = int(_job_desc.str.upper().isin(_excluded_upper).sum())
+        _work_check = _work_check[~_job_desc.str.upper().isin(_excluded_upper)]
+
+        blank_pi_before = int(_work_check[R391_COL_PI].apply(safe_str).eq("").sum())
+        blank_pi_after = int(df_391_out[R391_COL_PI_OUTPUT].apply(safe_str).eq("").sum())
+        pi_filled = blank_pi_before - blank_pi_after
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Funding rows (organized)", len(df_391_out))
+        m2.metric("Dropped (no employee)", _rows_no_employee)
+        m3.metric("Dropped (excluded job code)", _rows_excluded_job_code)
+        m4.metric("PI filled/self-assigned", pi_filled)
+        m5.metric("Unique PIs", df_391_out[R391_COL_PI_OUTPUT].apply(safe_str).replace("", pd.NA).nunique())
+
+        with st.expander("What the colors and shading mean", expanded=False):
+            st.markdown(
+                f"""
+- **Blue-gray shaded columns** — the original 391 export columns (Entity through Award), kept
+  unmodified and grouped together for reference alongside the organized columns.
+- 🟡 **Yellow cell** (Expected End Date) — the date is within **{R391_EXPIRING_SOON_MONTHS} months**
+  from today, **or** is any date already in the past (ending soon, or already ended).
+- 🔴 **Red row** — Activity is `990000`, `990001`, or `990002`, **or** Project begins with `"DKO"`.
+- **Duplicate rows** that were 100% identical across every column have already been removed,
+  keeping only the first occurrence.
+- **Annual Rate** = Monthly Rate × 12, whenever a Monthly Rate exists.
+- **Principal Investigator** is set to the employee's own name (reversed to "First Last") whenever
+  Job Code Description contains "PROF" or "LECT", regardless of what's listed in the source file.
+
+These rules are also documented on a **Legend** tab in the downloaded Excel file.
+                """
+            )
+
+        st.dataframe(df_391_out, use_container_width=True, height=480)
+
+
+        report_label_391 = st.text_input(
+            "Report label (used in filename)",
+            value=f"391_Filtered_{date.today().strftime('%Y-%m-%d')}",
+        )
+
+        if st.button("Generate Organized 391 Excel", type="primary", use_container_width=True):
+            xlsx_391_bytes = build_391_excel(df_391_out)
+            st.success("391 Excel generated!")
+            st.download_button(
+                "Download Organized 391",
+                data=xlsx_391_bytes,
+                file_name=f"{make_safe_filename_fragment(report_label_391)}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        st.stop()
+
+    # ============================================================
+    # GL MODE
+    # ============================================================
+    if db_type == GL_OPTION:
+        xl_gl = pd.ExcelFile(BytesIO(db_bytes))
+        gl_sheet = st.selectbox("GL sheet to use", options=xl_gl.sheet_names, index=0)
+
+        required_for_header = [GL_COL_CATEGORY, GL_COL_ACTUALS, GL_COL_PERIOD, GL_COL_ACTIVITY]
+        df_gl, detected_header_row0 = read_gl_with_auto_header(
+            db_bytes=db_bytes,
+            sheet_name=gl_sheet,
+            required_cols=required_for_header,
+            search_rows=80,
+        )
+
+        with st.expander(f"Header row detected at Excel row {detected_header_row0 + 1} — override?", expanded=False):
+            override = st.checkbox("Override detected header row", value=False)
+            if override:
+                override_row_excel = st.number_input(
+                    "Header row (Excel row number)",
+                    min_value=1,
+                    value=int(detected_header_row0 + 1),
+                    step=1,
+                )
+                df_gl = pd.read_excel(pd.ExcelFile(BytesIO(db_bytes)), sheet_name=gl_sheet, header=int(override_row_excel) - 1)
+                df_gl.columns = normalize_columns(df_gl.columns)
+                st.caption(f"Using overridden header row at Excel row **{int(override_row_excel)}**.")
+
+        col_category = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_CATEGORY, keywords=["category"])
+        col_actuals = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_ACTUALS, keywords=["actual"])
+        col_period = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_PERIOD, keywords=["accounting", "period"])
+        col_activity = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_ACTIVITY, keywords=["activity", "code"])
+        col_fin_dept = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_FIN_DEPT, keywords=["financial", "department"])
+        col_desc = find_column_by_exact_or_keywords(df_gl.columns, GL_COL_DESC, keywords=["description"])
+
+        df_subset = df_gl[[col_category, col_actuals, col_period, col_activity, col_fin_dept, col_desc]].copy()
+        df_subset = df_subset.rename(
+            columns={
+                col_category: GL_COL_CATEGORY,
+                col_actuals: GL_COL_ACTUALS,
+                col_period: GL_COL_PERIOD,
+                col_activity: GL_COL_ACTIVITY,
+                col_fin_dept: GL_COL_FIN_DEPT,
+                col_desc: GL_COL_DESC,
+            }
+        )
+
+        df_subset[GL_COL_CATEGORY] = df_subset[GL_COL_CATEGORY].apply(safe_str)
+        df_subset = df_subset[
+            df_subset[GL_COL_CATEGORY].str.upper().ne("N/A")
+            & df_subset[GL_COL_CATEGORY].ne("")
+        ]
+        df_subset["Notes"] = ""
+
+        dept_vals = [d for d in df_subset[GL_COL_FIN_DEPT].apply(safe_str).unique().tolist() if safe_str(d)]
+        if len(dept_vals) == 1:
+            dept_name = dept_vals[0]
+        elif len(dept_vals) == 0:
+            dept_name = "Financial Department"
+        else:
+            dept_name = "Multiple Departments"
+
+        df_subset[GL_COL_ACTUALS] = pd.to_numeric(df_subset[GL_COL_ACTUALS], errors="coerce").fillna(0.0)
+
+        pivot = (
+            df_subset.groupby(GL_COL_CATEGORY, dropna=False, as_index=False)[GL_COL_ACTUALS]
+            .sum()
+            .sort_values(by=GL_COL_ACTUALS, ascending=False, na_position="last")
+        )
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Transactions", len(df_subset))
+        m2.metric("Categories", df_subset[GL_COL_CATEGORY].nunique())
+        m3.metric("Department", dept_name)
+
+        tab_txn, tab_pivot = st.tabs(["Transactions", "Pivot by Category"])
+        with tab_txn:
+            st.dataframe(df_subset.head(50), use_container_width=True)
+        with tab_pivot:
+            st.dataframe(pivot, use_container_width=True)
+
+        report_label = st.text_input("Report label (used in filename)", value=f"{dept_name} Expenses")
+
+        if st.button("Generate GL Excel (pivot + check sheet)", type="primary", use_container_width=True):
+            xlsx_bytes = build_gl_excel(
+                df_subset=df_subset,
+                pivot_categories_actuals=pivot[[GL_COL_CATEGORY, GL_COL_ACTUALS]].copy(),
+                dept_name=dept_name,
+            )
+            st.success("GL Excel generated!")
+            st.download_button(
+                "Download GL Excel",
+                data=xlsx_bytes,
+                file_name=f"{make_safe_filename_fragment(report_label)}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+        st.stop()
+
+    # ============================================================
+    # PPM MODE
+    # ============================================================
+    df_master, report_date = read_aggy_master(db_bytes)
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        if report_date:
+            st.info(f"PPM download date detected: **{report_date}**")
+            date_label = report_date
+        else:
+            st.warning("Could not detect 'Report Run Date' — enter manually.")
+            date_label = st.text_input("Report Date (YYYY-MM-DD)", value="")
+    with c2:
+        st.markdown("&nbsp;")
+        do_active_only = st.checkbox("Active projects only", value=True)
+
+    status_col = find_column_by_exact_or_keywords(df_master.columns, STATUS_COL_NAME, keywords=["project", "status"])
+    df_master_view = df_master[df_master[status_col] == "ACTIVE"].copy() if do_active_only else df_master.copy()
+
+    # --- Filter out INACTIVE rows (Award Status, Project Status, Task Status) ---
+    rows_before = len(df_master_view)
+    df_master_view = filter_inactive_rows(df_master_view)
+    rows_after = len(df_master_view)
+    rows_removed = rows_before - rows_after
+    if rows_removed > 0:
+        st.caption(f"ℹ️ {rows_removed} row(s) removed — Award/Project/Task status was 'Inactive'.")
+
+    df_award = None
+    has_award = award_file is not None
+
+    if has_award:
+        award_bytes = award_file.getvalue()
+        xl_aw = pd.ExcelFile(BytesIO(award_bytes))
+        award_sheet = st.selectbox("Award sheet to use", options=xl_aw.sheet_names, index=0)
+        df_award = read_award(award_bytes, sheet_name=award_sheet)
+
+        tab_ppm, tab_award = st.tabs(["PPM preview", "Award Info preview"])
+        with tab_ppm:
+            st.dataframe(df_master_view.head(25), use_container_width=True)
+        with tab_award:
+            st.dataframe(df_award.head(25), use_container_width=True)
+
+        with st.expander("Merge column settings", expanded=False):
+            default_master_merge = PROJECT_COL_NAME if PROJECT_COL_NAME in df_master_view.columns else df_master_view.columns[0]
+
+            default_aw_merge = None
+            for cand in ["Aggie Enterprise Project #", "AGGIE ENTERPRISE PROJECT #", "AGGIE ENTERPRISE PROJECT # "]:
+                if cand in df_award.columns:
+                    default_aw_merge = cand
+                    break
+            if default_aw_merge is None:
+                default_aw_merge = df_award.columns[0]
+
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                master_merge_col = st.selectbox(
+                    "PPM merge column",
+                    options=list(df_master_view.columns),
+                    index=list(df_master_view.columns).index(default_master_merge) if default_master_merge in df_master_view.columns else 0,
+                )
+            with mc2:
+                award_merge_col = st.selectbox(
+                    "Award Document merge column",
+                    options=list(df_award.columns),
+                    index=list(df_award.columns).index(default_aw_merge) if default_aw_merge in df_award.columns else 0,
+                )
+
+            default_aw_rate = None
+            for cand in ["INDIRECT RATE", "Indirect Rate", "Indirect rate"]:
+                if cand in df_award.columns:
+                    default_aw_rate = cand
+                    break
+            if default_aw_rate is None:
+                indirect_candidates = [c for c in df_award.columns if "indirect" in c.lower()]
+                default_aw_rate = indirect_candidates[0] if indirect_candidates else df_award.columns[-1]
+
+            award_rate_col = st.selectbox(
+                "Award Document indirect-rate column",
+                options=list(df_award.columns),
+                index=list(df_award.columns).index(default_aw_rate) if default_aw_rate in df_award.columns else 0,
+            )
+
+        master_keys = df_master_view[master_merge_col].apply(canon_key)
+        award_keys = df_award[award_merge_col].apply(canon_key)
+
+        master_key_set = set(k for k in master_keys.unique() if k)
+        award_key_set = set(k for k in award_keys.unique() if k)
+        intersect = master_key_set.intersection(award_key_set)
+        match_rate_unique = (len(intersect) / len(master_key_set)) if master_key_set else 0.0
+
+        st.markdown("##### Merge preview")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("PPM projects", len(master_key_set))
+        m2.metric("Award projects", len(award_key_set))
+        m3.metric("Matched", len(intersect))
+        m4.metric("Match rate", f"{match_rate_unique:.1%}")
+
+        if show_key_samples:
+            with st.expander("Project # samples", expanded=False):
+                c3, c4 = st.columns(2)
+                with c3:
+                    st.caption("PPM key sample")
+                    st.code(", ".join(list(master_key_set)[:20]) if master_key_set else "(none)")
+                with c4:
+                    st.caption("Award key sample")
+                    st.code(", ".join(list(award_key_set)[:20]) if award_key_set else "(none)")
+
+        if show_unmatched:
+            missing = sorted(list(master_key_set - award_key_set))[:40]
+            if missing:
+                with st.expander("Unmatched PPM projects", expanded=False):
+                    st.warning("Some PPM projects were not found in the Award document:")
+                    st.code(", ".join(missing[:40]))
+    else:
+        st.dataframe(df_master_view.head(25), use_container_width=True)
+        st.info("No Award Info document uploaded — reports will be generated WITHOUT indirect calculations.")
+
+    st.divider()
+
+    if st.button("Generate ZIP (one Excel per PI)", type="primary", use_container_width=True):
+        df_work_full = df_master_view.copy()
+
+        project_col = find_column_by_exact_or_keywords(df_work_full.columns, PROJECT_COL_NAME, keywords=["project", "number"])
+        task_name_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NAME_COL_NAME, keywords=["task", "name"])
+        task_num_col = find_column_by_exact_or_keywords(df_work_full.columns, TASK_NUMBER_COL_NAME, keywords=["task", "number"])
+
+        balance_candidates = [c for c in df_work_full.columns if str(c).startswith("Budget Balance")]
+        if not balance_candidates:
+            raise KeyError("PPM document is missing a column starting with 'Budget Balance'.")
+        balance_col = balance_candidates[0]
+
+        keep_cols = []
+        for c in [
+            PI_COL_NAME,
+            project_col,
+            "Project Name",
+            "Project Manager",
+            task_name_col,
+            task_num_col,
+            "Budget",
+            "expenses",
+            balance_col,
+        ]:
+            if c in df_work_full.columns and c not in keep_cols:
+                keep_cols.append(c)
+
+        df_work = df_work_full[keep_cols].copy()
+
+        p = df_work[project_col].apply(safe_str).str.replace(".0", "", regex=False)
+        t = df_work[task_num_col].apply(safe_str).str.replace(".0", "", regex=False)
+        df_work[project_col] = (p + "-" + t).str.strip("-")
+
+        if "Project Name" in df_work.columns:
+            df_work["Project Name"] = df_work["Project Name"].apply(safe_str) + " – " + df_work[task_name_col].apply(safe_str)
+
+        df_work = df_work.drop(columns=[task_name_col, task_num_col], errors="ignore")
+        df_work = df_work.rename(columns={"Budget": "Allocated Budget", balance_col: "Current Balance"})
+
+        if has_award and df_award is not None:
+            df_work["_merge_key"] = df_work_full[master_merge_col].apply(canon_key)
+
+            df_aw = df_award.copy()
+            df_aw["_merge_key"] = df_aw[award_merge_col].apply(canon_key)
+
+            df_aw_sub = df_aw[["_merge_key", award_rate_col]].copy()
+            df_aw_sub = df_aw_sub.drop_duplicates(subset=["_merge_key"], keep="first")
+            df_aw_sub = df_aw_sub.rename(columns={award_rate_col: "Indirect Rate"})
+
+            df_merged = df_work.merge(df_aw_sub, on="_merge_key", how="left").drop(columns=["_merge_key"])
+
+            df_merged["Indirect Rate"] = pd.to_numeric(df_merged["Indirect Rate"], errors="coerce").fillna(0.0)
+            df_merged["Allocated Budget"] = pd.to_numeric(df_merged["Allocated Budget"], errors="coerce")
+            df_merged["Current Balance"] = pd.to_numeric(df_merged["Current Balance"], errors="coerce")
+
+            denom = 1.0 + df_merged["Indirect Rate"]
+            df_merged[ALLOC_BUDGET_NET_COL] = df_merged["Allocated Budget"] / denom
+            df_merged[CURRENT_BAL_NET_COL] = df_merged["Current Balance"] / denom
+
+            df_out = df_merged.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
+        else:
+            df_work["Allocated Budget"] = pd.to_numeric(df_work["Allocated Budget"], errors="coerce")
+            df_work["Current Balance"] = pd.to_numeric(df_work["Current Balance"], errors="coerce")
+            df_work[ALLOC_BUDGET_NET_COL] = df_work["Allocated Budget"]
+            df_work[CURRENT_BAL_NET_COL] = df_work["Current Balance"]
+            df_out = df_work.drop(columns=["Allocated Budget", "Current Balance"], errors="ignore")
+
+        if safe_str(date_label):
+            df_out["Date Pulled"] = safe_str(date_label)
+
+        if PI_COL_NAME not in df_out.columns:
+            raise KeyError(f"PI column '{PI_COL_NAME}' not found in PPM. Columns: {list(df_out.columns)}")
+        df_out[PI_COL_NAME] = df_out[PI_COL_NAME].apply(normalize_pi_last_first)
+
+        desired = [
+            PI_COL_NAME,
+            "Project Manager",
+            "Date Pulled",
+            project_col,
+            "Project Name",
+            ALLOC_BUDGET_NET_COL,
+            CURRENT_BAL_NET_COL,
+            "Indirect Rate",
+            "expenses",
+        ]
+        desired = [c for c in desired if c in df_out.columns]
+        remaining = [c for c in df_out.columns if c not in desired]
+        df_out = df_out[desired + remaining]
+
+        report_label = "Budget Report"
+        if safe_str(date_label):
+            report_label = f"{safe_str(date_label)} Budget Report"
+
+        hide_indirect_effective = hide_indirect_in_output if ("Indirect Rate" in df_out.columns) else True
+
+        zip_bytes = build_pi_zip(
+            df_out=df_out,
+            pi_col=PI_COL_NAME,
+            hide_indirect=hide_indirect_effective,
+            report_label=report_label,
+        )
+
+        st.success("ZIP generated!")
+        st.download_button(
+            "Download ZIP (PI files)",
+            data=zip_bytes,
+            file_name=f"{make_safe_filename_fragment(report_label)} - PI Files.zip",
+            mime="application/zip",
+        )
+
+except Exception as e:
+    st.error(f"Error: {e}")
+    if show_trace:
+        st.code(traceback.format_exc())
