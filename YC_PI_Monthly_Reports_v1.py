@@ -1089,7 +1089,8 @@ R339_COL_JOB_CODE = "Job Code"
 R339_COL_UC_EARN_DATE = "UC Earn End Date"  # closest match to the requested "UC Earn Date";
                                              # this source file has no column named exactly "UC Earn Date"
 R339_COL_MONTHLY_RATE = "Monthly Rate"
-R339_COL_EXPENSE_TYPE = "Expense Type"
+R339_COL_EXPENSE_TYPE = "Expense Type"  # source column only: rows are combined across expense types
+                                         # and the column is not shown anywhere in the app or exports
 R339_COL_MONETARY_AMOUNT = "Monetary Amount"
 
 R339_OUTPUT_COLUMNS = [
@@ -1101,7 +1102,6 @@ R339_OUTPUT_COLUMNS = [
     R339_COL_JOB_CODE,
     R339_COL_UC_EARN_DATE,
     R339_COL_MONTHLY_RATE,
-    R339_COL_EXPENSE_TYPE,
     R339_COL_MONETARY_AMOUNT,
 ]
 
@@ -1116,11 +1116,37 @@ def read_339(file_bytes: bytes, sheet_name=0) -> pd.DataFrame:
 
 
 def organize_339(df: pd.DataFrame) -> pd.DataFrame:
-    """Trim a raw 339 export down to just the columns this module works with."""
+    """
+    Trim a raw 339 export down to just the columns this module works with.
+
+    Expense Type is not kept: rows that differ only by expense type (SALARY / FRINGE) are combined
+    into one row whose Monetary Amount is the sum. Fringe rows carry a slightly different Monthly
+    Rate than the salary row on the same paycheck, so the salary row's Monthly Rate is kept.
+    """
     missing = [c for c in R339_OUTPUT_COLUMNS if c not in df.columns]
     if missing:
         raise KeyError(f"339 file is missing expected column(s): {missing}. Columns found: {list(df.columns)}")
-    return df[R339_OUTPUT_COLUMNS].copy()
+
+    keep = list(R339_OUTPUT_COLUMNS)
+    if R339_COL_EXPENSE_TYPE in df.columns:
+        keep.append(R339_COL_EXPENSE_TYPE)
+    work = df[keep].copy()
+    work[R339_COL_MONETARY_AMOUNT] = pd.to_numeric(work[R339_COL_MONETARY_AMOUNT], errors="coerce")
+
+    # Put SALARY rows first so "first" picks the salary row's Monthly Rate
+    if R339_COL_EXPENSE_TYPE in work.columns:
+        not_salary = work[R339_COL_EXPENSE_TYPE].apply(safe_str).str.upper().ne("SALARY")
+        work = work.assign(_not_salary=not_salary).sort_values("_not_salary", kind="stable").drop(columns="_not_salary")
+
+    group_cols = [c for c in R339_OUTPUT_COLUMNS if c not in (R339_COL_MONTHLY_RATE, R339_COL_MONETARY_AMOUNT)]
+    out = (
+        work.groupby(group_cols, dropna=False, as_index=False, sort=False)
+        .agg({R339_COL_MONTHLY_RATE: "first", R339_COL_MONETARY_AMOUNT: "sum"})
+    )
+    out = out[R339_OUTPUT_COLUMNS]
+    return out.sort_values(
+        [R339_COL_PROJECT, R339_COL_EMP_NAME, R339_COL_UC_EARN_DATE], kind="stable", na_position="last"
+    ).reset_index(drop=True)
 
 
 def filter_339_date_range(df_out: pd.DataFrame, start_date, end_date) -> pd.DataFrame:
@@ -1130,15 +1156,28 @@ def filter_339_date_range(df_out: pd.DataFrame, start_date, end_date) -> pd.Data
 
 
 R339_PREVIEW_MONTHS = 3
-R339_CHANGE_TOLERANCE = 0.01  # dollars; paycheck differences smaller than one cent are ignored
+R339_CHANGE_TOLERANCE = 0.01   # dollars; amount differences smaller than one cent are ignored
+R339_PAID_THRESHOLD = 0.005    # a project counts as "paid" on a paycheck if its net amount is at least a half-cent
 
-R339_STATUS_CHANGED = "⚠️ Changed"
-R339_STATUS_NEW = "🆕 New"
-R339_STATUS_SAME = "✓ No change"
-R339_STATUS_INACTIVE = "— Inactive"
+# Line-level allocation status (one line = one Project x Employee)
+R339_LINE_ADDED = "➕ Added"
+R339_LINE_REMOVED = "➖ Removed"
+R339_LINE_SAME = "✓ Same"
+R339_LINE_NEW = "🆕 New"
+R339_LINE_INACTIVE = "— Inactive"
 
-# One "pay line" = one Project x Employee x Expense Type (the granularity of the pivot rows)
-R339_LINE_KEY = [R339_COL_PROJECT, R339_COL_EMP_NAME, R339_COL_EXPENSE_TYPE]
+# List-level allocation flag (PRIMARY): which projects the pay is charged to
+R339_ALLOC_CHANGED = "🔀 Changed"
+R339_ALLOC_NEW = "🆕 New"
+R339_ALLOC_SAME = "✓ Same"
+R339_ALLOC_INACTIVE = "— Inactive"
+
+# Amount flag (SECONDARY): how much is paid, for projects charged in both months
+R339_AMT_CHANGED = "⚠️ Changed"
+R339_AMT_SAME = "✓ Same"
+R339_AMT_NA = "—"
+
+R339_LINE_KEY = [R339_COL_PROJECT, R339_COL_EMP_NAME]
 
 
 @st.cache_data(show_spinner=False)
@@ -1153,77 +1192,111 @@ def load_339_trimmed(file_bytes: bytes, sheet_name) -> pd.DataFrame:
 
 def compute_339_line_changes(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Flag month-over-month pay changes, one row per pay line (Project x Employee x Expense Type).
+    Month-over-month flags, one row per pay line (Project x Employee).
 
-    For each line, its most recent paycheck ("Current") is compared with its most recent paycheck
-    in the previous calendar month ("Prior"). Comparing paychecks rather than monthly totals keeps
-    partial months and months with different numbers of pay periods from looking like changes.
+    Each employee is compared on their own pay cycle: their most recent paycheck ("Current") versus
+    their most recent paycheck in the previous calendar month ("Prior"). The set of projects that
+    received pay on those two paychecks gives the PRIMARY flag, and the amounts give the SECONDARY flag.
 
-      - Changed:  Current differs from Prior by at least one cent
-      - New:      the line was paid in its current month but not in the month before
-      - No change
-      - Inactive: the line's latest paycheck is older than the previous calendar month, relative
-                  to the most recent month in the data (no longer being paid)
+    Allocation (primary, which projects the pay is charged to):
+      - Added:    paid on this project on the current paycheck, but not on the prior one
+      - Removed:  paid on this project on the prior paycheck, but not on the current one
+      - Same:     paid on this project on both
+      - New:      the employee has no paycheck in the previous month, so there is nothing to compare
+      - Inactive: the employee's latest paycheck is older than the previous calendar month (relative
+                  to the most recent month in the data), or the project is on neither paycheck
 
-    Lines not yet paid in the most recent month (e.g. month-end payroll that hasn't posted) are
-    compared on their own latest month, so they are not mistaken for ended funding.
+    Amount (secondary): for "Same" lines only, whether the amount differs by at least one cent.
+
+    Comparing each employee's own paychecks (instead of calendar-month totals) keeps partial months
+    and month-end payroll that has not posted yet from looking like projects being dropped.
     """
-    out_cols = R339_LINE_KEY + ["Current Pay Date", "Current", "Prior Pay Date", "Prior", "Change", "Status"]
-    d = df[R339_LINE_KEY + [R339_COL_UC_EARN_DATE, R339_COL_MONETARY_AMOUNT]].copy()
-    d[R339_COL_UC_EARN_DATE] = pd.to_datetime(d[R339_COL_UC_EARN_DATE], errors="coerce")
-    d[R339_COL_MONETARY_AMOUNT] = pd.to_numeric(d[R339_COL_MONETARY_AMOUNT], errors="coerce").fillna(0.0)
+    out_cols = R339_LINE_KEY + ["Allocation", "Amount", "Current", "Prior", "Change"]
+    emp, proj = R339_COL_EMP_NAME, R339_COL_PROJECT
+    date_c, amt_c = R339_COL_UC_EARN_DATE, R339_COL_MONETARY_AMOUNT
+
+    d = df[R339_LINE_KEY + [date_c, amt_c]].copy()
+    d[date_c] = pd.to_datetime(d[date_c], errors="coerce")
+    d[amt_c] = pd.to_numeric(d[amt_c], errors="coerce").fillna(0.0)
     for c in R339_LINE_KEY:
         d[c] = d[c].apply(safe_str)
-    d = d.dropna(subset=[R339_COL_UC_EARN_DATE])
+    d = d.dropna(subset=[date_c])
     if d.empty:
         return pd.DataFrame(columns=out_cols)
 
-    d["Month"] = d[R339_COL_UC_EARN_DATE].dt.to_period("M")
+    d["Month"] = d[date_c].dt.to_period("M")
     latest_month = d["Month"].max()
 
-    per_pay = (
-        d.groupby(R339_LINE_KEY + [R339_COL_UC_EARN_DATE, "Month"], as_index=False)[R339_COL_MONETARY_AMOUNT]
-        .sum()
-        .sort_values(R339_COL_UC_EARN_DATE, kind="stable")
-    )
+    per_pay = d.groupby([emp, proj, date_c, "Month"], as_index=False)[amt_c].sum()
+    paid = per_pay[per_pay[amt_c].abs() >= R339_PAID_THRESHOLD]
+    pairs = per_pay[R339_LINE_KEY].drop_duplicates().reset_index(drop=True)
 
+    if paid.empty:
+        lines = pairs.copy()
+        lines["Allocation"] = R339_LINE_INACTIVE
+        lines["Amount"] = R339_AMT_NA
+        for c in ("Current", "Prior", "Change"):
+            lines[c] = float("nan")
+        return lines[out_cols]
+
+    # Each employee's pay dates = dates on which any project was paid
+    emp_dates = paid[[emp, date_c, "Month"]].drop_duplicates().sort_values(date_c, kind="stable")
     current = (
-        per_pay.groupby(R339_LINE_KEY, as_index=False).tail(1)
-        .rename(columns={
-            R339_COL_UC_EARN_DATE: "Current Pay Date",
-            R339_COL_MONETARY_AMOUNT: "Current",
-            "Month": "Current Month",
-        })
+        emp_dates.groupby(emp, as_index=False).tail(1)
+        .rename(columns={date_c: "Current Date", "Month": "Current Month"})
     )
     current["Prior Month"] = current["Current Month"] - 1
-
     prior = (
-        per_pay.groupby(R339_LINE_KEY + ["Month"], as_index=False).tail(1)
-        .rename(columns={
-            R339_COL_UC_EARN_DATE: "Prior Pay Date",
-            R339_COL_MONETARY_AMOUNT: "Prior",
-            "Month": "Prior Month",
-        })
+        emp_dates.groupby([emp, "Month"], as_index=False).tail(1)
+        .rename(columns={date_c: "Prior Date", "Month": "Prior Month"})
+    )
+    ref = current.merge(prior, on=[emp, "Prior Month"], how="left")
+
+    cur_rows = (
+        paid.merge(ref[[emp, "Current Date"]].rename(columns={"Current Date": date_c}), on=[emp, date_c])
+        [[emp, proj, amt_c]].rename(columns={amt_c: "Current"})
+    )
+    pri_rows = (
+        paid.merge(ref.dropna(subset=["Prior Date"])[[emp, "Prior Date"]].rename(columns={"Prior Date": date_c}),
+                   on=[emp, date_c])
+        [[emp, proj, amt_c]].rename(columns={amt_c: "Prior"})
     )
 
-    lines = current.merge(prior, on=R339_LINE_KEY + ["Prior Month"], how="left")
+    lines = (
+        pairs.merge(cur_rows, on=[emp, proj], how="left")
+        .merge(pri_rows, on=[emp, proj], how="left")
+        .merge(ref[[emp, "Current Month", "Prior Date"]], on=emp, how="left")
+    )
+
+    has_cur = lines["Current"].notna()
+    has_pri = lines["Prior"].notna()
+    emp_has_prior = lines["Prior Date"].notna()
+    emp_active = (lines["Current Month"] >= (latest_month - 1)).fillna(False).astype(bool)
+
+    alloc = pd.Series(R339_LINE_INACTIVE, index=lines.index, dtype="object")
+    alloc.loc[emp_active & has_cur & ~emp_has_prior] = R339_LINE_NEW
+    alloc.loc[emp_active & emp_has_prior & has_cur & has_pri] = R339_LINE_SAME
+    alloc.loc[emp_active & emp_has_prior & has_cur & ~has_pri] = R339_LINE_ADDED
+    alloc.loc[emp_active & emp_has_prior & ~has_cur & has_pri] = R339_LINE_REMOVED
 
     diff = (lines["Current"] - lines["Prior"]).round(2)
-    has_prior = lines["Prior"].notna()
+    amount_status = pd.Series(R339_AMT_NA, index=lines.index, dtype="object")
+    is_same = alloc == R339_LINE_SAME
+    amount_status.loc[is_same] = R339_AMT_SAME
+    amount_status.loc[is_same & (diff.abs() >= R339_CHANGE_TOLERANCE)] = R339_AMT_CHANGED
 
-    status = pd.Series(R339_STATUS_SAME, index=lines.index, dtype="object")
-    status.loc[~has_prior] = R339_STATUS_NEW
-    status.loc[has_prior & (diff.abs() >= R339_CHANGE_TOLERANCE)] = R339_STATUS_CHANGED
-    status.loc[lines["Current Month"] < (latest_month - 1)] = R339_STATUS_INACTIVE
-    lines["Status"] = status
-
-    lines["Change"] = diff.where(lines["Status"] == R339_STATUS_CHANGED)
+    lines["Allocation"] = alloc
+    lines["Amount"] = amount_status
+    lines["Change"] = diff.where(amount_status == R339_AMT_CHANGED)
     return lines[out_cols].reset_index(drop=True)
 
 
 def summarize_339_changes(lines: pd.DataFrame, split_col: str) -> pd.DataFrame:
-    """Roll pay-line statuses up to one row per Project (or Employee) for the clickable list."""
-    cols = [split_col, "Status", "Lines changed", "Active lines", "Net change ($/paycheck)"]
+    """
+    Roll pay-line flags up to one row per Project (or Employee) for the clickable list.
+    Allocation is the primary flag and drives the sort order; Amount is secondary.
+    """
+    cols = [split_col, "Allocation", "Amount", "Allocation changes", "Amount changes", "Net change ($/paycheck)"]
     if lines.empty:
         return pd.DataFrame(columns=cols)
 
@@ -1231,35 +1304,59 @@ def summarize_339_changes(lines: pd.DataFrame, split_col: str) -> pd.DataFrame:
     for item, grp in lines.groupby(split_col, sort=False):
         if not safe_str(item):
             continue
-        n_changed = int((grp["Status"] == R339_STATUS_CHANGED).sum())
-        n_new = int((grp["Status"] == R339_STATUS_NEW).sum())
-        n_same = int((grp["Status"] == R339_STATUS_SAME).sum())
-        if n_changed:
-            item_status = R339_STATUS_CHANGED
+        n_added = int((grp["Allocation"] == R339_LINE_ADDED).sum())
+        n_removed = int((grp["Allocation"] == R339_LINE_REMOVED).sum())
+        n_new = int((grp["Allocation"] == R339_LINE_NEW).sum())
+        n_same = int((grp["Allocation"] == R339_LINE_SAME).sum())
+        n_amt = int((grp["Amount"] == R339_AMT_CHANGED).sum())
+
+        if n_added + n_removed:
+            alloc_flag = R339_ALLOC_CHANGED
         elif n_new:
-            item_status = R339_STATUS_NEW
+            alloc_flag = R339_ALLOC_NEW
         elif n_same:
-            item_status = R339_STATUS_SAME
+            alloc_flag = R339_ALLOC_SAME
         else:
-            item_status = R339_STATUS_INACTIVE
+            alloc_flag = R339_ALLOC_INACTIVE
+
+        if n_amt:
+            amt_flag = R339_AMT_CHANGED
+        elif n_same:
+            amt_flag = R339_AMT_SAME
+        else:
+            amt_flag = R339_AMT_NA
+
+        if alloc_flag == R339_ALLOC_CHANGED:
+            priority = 0
+        elif amt_flag == R339_AMT_CHANGED:
+            priority = 1
+        elif alloc_flag == R339_ALLOC_NEW:
+            priority = 2
+        else:
+            priority = 3
+
         rows.append({
             split_col: item,
-            "Status": item_status,
-            "Lines changed": n_changed,
-            "Active lines": n_changed + n_new + n_same,
-            "Net change ($/paycheck)": float(grp.loc[grp["Status"] == R339_STATUS_CHANGED, "Change"].sum()),
+            "Allocation": alloc_flag,
+            "Amount": amt_flag,
+            "Allocation changes": n_added + n_removed,
+            "Amount changes": n_amt,
+            "Net change ($/paycheck)": float(grp.loc[grp["Amount"] == R339_AMT_CHANGED, "Change"].sum()),
+            "_priority": priority,
         })
 
-    out = pd.DataFrame(rows, columns=cols)
-    return out.sort_values(split_col, key=lambda s: s.str.lower(), kind="stable").reset_index(drop=True)
+    out = pd.DataFrame(rows)
+    out["_name"] = out[split_col].str.lower()
+    out = out.sort_values(["_priority", "_name"], kind="stable").drop(columns=["_priority", "_name"])
+    return out[cols].reset_index(drop=True)
 
 
 def build_339_preview_pivot(df: pd.DataFrame, split_col: str, item: str, row_fields: list,
                             line_changes: pd.DataFrame, months: int = R339_PREVIEW_MONTHS):
     """
     On-screen example pivot for one Project (or Employee), limited to the last `months` calendar
-    months of the data. Returns (pivot_df, window_label). Same layout as the exported Pivot sheet,
-    plus the pay-change status for each row.
+    months of the data. Returns (pivot_df, window_label). Same layout as the exported Pivot sheet
+    (one row per Employee or Project, columns = pay dates), plus the two flags for each row.
     """
     d = df.copy()
     d[R339_COL_UC_EARN_DATE] = pd.to_datetime(d[R339_COL_UC_EARN_DATE], errors="coerce")
@@ -1292,9 +1389,10 @@ def build_339_preview_pivot(df: pd.DataFrame, split_col: str, item: str, row_fie
 
     if not line_changes.empty:
         lc = line_changes[line_changes[split_col].apply(safe_str) == item]
-        lc = lc[row_fields + ["Status", "Change"]].rename(columns={"Status": "Pay change", "Change": "Change ($)"})
+        lc = lc[row_fields + ["Allocation", "Amount", "Change"]].rename(columns={"Change": "Change ($)"})
         pivot = pivot.merge(lc, on=row_fields, how="left")
-        pivot["Pay change"] = pivot["Pay change"].fillna("")
+        pivot["Allocation"] = pivot["Allocation"].fillna("")
+        pivot["Amount"] = pivot["Amount"].fillna("")
 
     return pivot, window_label
 
@@ -1523,47 +1621,59 @@ try:
 
         if r339_sort_choice == R339_SORT_BY_PROJECT:
             split_col = R339_COL_PROJECT
-            row_fields = [R339_COL_EMP_NAME, R339_COL_EXPENSE_TYPE]
+            row_fields = [R339_COL_EMP_NAME]
         else:
             split_col = R339_COL_EMP_NAME
-            row_fields = [R339_COL_PROJECT, R339_COL_EXPENSE_TYPE]
+            row_fields = [R339_COL_PROJECT]
         item_noun = "project" if split_col == R339_COL_PROJECT else "employee"
 
         line_changes_339 = compute_339_line_changes(df_339_lookback)
         item_summary_339 = summarize_339_changes(line_changes_339, split_col)
         items_in_range_339 = set(df_339_filtered[split_col].apply(safe_str).unique())
         item_summary_339 = item_summary_339[item_summary_339[split_col].isin(items_in_range_339)].reset_index(drop=True)
-        n_flagged_339 = int((item_summary_339["Status"] == R339_STATUS_CHANGED).sum())
+        n_alloc_339 = int((item_summary_339["Allocation"] == R339_ALLOC_CHANGED).sum())
+        n_amt_339 = int((item_summary_339["Amount"] == R339_AMT_CHANGED).sum())
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Rows in range", len(df_339_filtered))
         m2.metric("Unique Projects", df_339_filtered[R339_COL_PROJECT].apply(safe_str).nunique())
         m3.metric("Unique Employees", df_339_filtered[R339_COL_EMP_NAME].apply(safe_str).nunique())
-        m4.metric(f"{item_noun.capitalize()}s with pay changes", n_flagged_339)
+        m4.metric(f"{item_noun.capitalize()}s: allocation changed", n_alloc_339)
+        m5.metric(f"{item_noun.capitalize()}s: amount changed", n_amt_339)
 
         _latest_ts = pd.to_datetime(df_339_lookback[R339_COL_UC_EARN_DATE], errors="coerce").max()
         with st.expander("How pay changes are flagged", expanded=False):
             st.markdown(
                 f"""
-- Each **pay line** (Project × Employee × Expense Type) has its **latest paycheck** compared with its
-  **latest paycheck in the previous calendar month**. Latest pay date in range: **{_latest_ts:%m/%d/%Y}**.
-- ⚠️ **Changed** — the two paychecks differ by at least one cent. 🆕 **New** — paid this month, nothing the month before.
-  ✓ **No change**. — **Inactive** — no pay in the last two months.
-- Pay lines not yet paid in the most recent month (for example month-end payroll that has not posted yet) are
-  compared using their own most recent month instead, so they are not mistaken for ended funding.
-- A {item_noun} is flagged if **any** of its pay lines changed. *Net change* is the sum of the per-paycheck
-  differences on those lines.
+Each employee's **latest paycheck** is compared with their **latest paycheck in the previous calendar month**
+(latest pay date in range: **{_latest_ts:%m/%d/%Y}**). Two flags result:
+
+1. **Allocation** (primary) — did the **set of projects** the employee is paid from change?
+   🔀 **Changed** = a project was added or dropped. 🆕 **New** = no paycheck in the previous month to compare.
+   ✓ **Same** = identical projects. — **Inactive** = no recent pay.
+2. **Amount** (secondary) — for projects paid in **both** paychecks, did the dollars differ by at least one cent?
+   ⚠️ **Changed** / ✓ **Same**.
+
+- A {item_noun} is flagged if **any** of its pay lines changed. Salary and fringe are combined.
+- The list is sorted with allocation changes first, then amount-only changes.
+- Each employee is compared on their own pay cycle, so month-end payroll that has not posted yet is not
+  mistaken for ended funding.
 - The flags and the 3-month preview look back from the **end** of the selected date range.
                 """
             )
 
         st.markdown(f"#### {item_noun.capitalize()} list")
-        only_flagged = st.checkbox(
-            f"Show only {item_noun}s with pay changes", value=False, key="r339_only_flagged",
+        filter_choice = st.radio(
+            "Show",
+            options=["All", "Allocation changed", "Amount changed"],
+            horizontal=True,
+            key="r339_filter",
         )
         view_df = item_summary_339
-        if only_flagged:
-            view_df = view_df[view_df["Status"] == R339_STATUS_CHANGED].reset_index(drop=True)
+        if filter_choice == "Allocation changed":
+            view_df = view_df[view_df["Allocation"] == R339_ALLOC_CHANGED].reset_index(drop=True)
+        elif filter_choice == "Amount changed":
+            view_df = view_df[view_df["Amount"] == R339_AMT_CHANGED].reset_index(drop=True)
 
         col_list, col_preview = st.columns([2, 3])
 
@@ -1585,7 +1695,7 @@ try:
                         on_select="rerun",
                         selection_mode="single-row",
                         column_config=list_config,
-                        key=f"r339_items_{split_col}_{only_flagged}",
+                        key=f"r339_items_{split_col}_{filter_choice}",
                     )
                     _rows = list(event.selection.rows)
                     if _rows and _rows[0] < len(view_df):
@@ -1610,7 +1720,7 @@ try:
                     preview_config = {
                         c: st.column_config.NumberColumn(format="$%.2f")
                         for c in preview_df.columns
-                        if c not in row_fields and c != "Pay change"
+                        if c not in row_fields and c not in ("Allocation", "Amount")
                     }
                     st.dataframe(preview_df, use_container_width=True, hide_index=True, column_config=preview_config)
 
@@ -1621,7 +1731,7 @@ try:
 
         st.caption(
             f"The ZIP below splits the selected range into one file per **{split_col}**, with pivot rows "
-            f"**{row_fields[0]}** then **{row_fields[1]}**, columns = {R339_COL_UC_EARN_DATE}, "
+            f"**{row_fields[0]}** as the pivot rows, columns = {R339_COL_UC_EARN_DATE}, "
             f"values = sum of {R339_COL_MONETARY_AMOUNT}."
         )
 
