@@ -87,11 +87,41 @@ st.markdown(
     .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5 {{ color: var(--aggie-blue); font-weight: 700; }}
     .stApp a {{ color: #266BAC; }}
 
-    /* Sidebar */
+    /* Sidebar: dark Aggie Blue with light text */
     [data-testid="stSidebar"] {{
-        background: var(--aggie-tint);
+        background: var(--aggie-blue);
         border-right: 3px solid var(--aggie-gold);
     }}
+    [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3,
+    [data-testid="stSidebar"] h4, [data-testid="stSidebar"] h5 {{ color: var(--aggie-gold); }}
+    [data-testid="stSidebar"] p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] li,
+    [data-testid="stSidebar"] span, [data-testid="stSidebar"] small,
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] * {{ color: #f2f5fa; }}
+    [data-testid="stSidebar"] a {{ color: var(--aggie-gold); }}
+    [data-testid="stSidebar"] hr {{ border-color: rgba(255,255,255,0.25); }}
+    /* Text boxes, dropdowns and date pickers stay light so what you type is readable */
+    [data-testid="stSidebar"] [data-baseweb="select"] > div,
+    [data-testid="stSidebar"] [data-baseweb="input"],
+    [data-testid="stSidebar"] [data-baseweb="input"] > div,
+    [data-testid="stSidebar"] [data-baseweb="base-input"] {{
+        background-color: #ffffff;
+    }}
+    [data-testid="stSidebar"] [data-baseweb="select"] *,
+    [data-testid="stSidebar"] [data-baseweb="input"] input,
+    [data-testid="stSidebar"] [data-baseweb="base-input"] input {{ color: var(--aggie-blue); }}
+    /* File uploader */
+    [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] {{
+        background: rgba(255,255,255,0.08);
+        border: 1px dashed rgba(255,255,255,0.45);
+    }}
+    [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] * {{ color: #f2f5fa; }}
+    [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button {{
+        background: #ffffff; border-color: #ffffff;
+    }}
+    [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button * {{ color: var(--aggie-blue); }}
+    /* Radio / checkbox dots use gold */
+    [data-testid="stSidebar"] [role="radiogroup"] label > div:first-child {{ border-color: var(--aggie-gold); }}
 
     /* Metrics */
     [data-testid="stMetric"] {{
