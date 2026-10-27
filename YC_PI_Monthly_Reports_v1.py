@@ -49,6 +49,105 @@ st.set_page_config(
     layout="wide",
 )
 
+
+# -----------------------------
+# UC DAVIS LOOK & FEEL
+# -----------------------------
+# Font: Montserrat (free Google Font, close to UC Davis's Proxima Nova), loaded in the CSS below.
+
+AGGIE_BLUE = "#022851"
+AGGIE_GOLD = "#FFBF00"
+AGGIE_BLUE_DARK = "#01172f"
+AGGIE_TINT = "#EEF2F7"   # pale blue-grey for sidebar / panels
+
+st.markdown(
+    f"""
+    <style>
+    @import url("https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap");
+
+    :root {{
+        --aggie-blue: {AGGIE_BLUE};
+        --aggie-gold: {AGGIE_GOLD};
+        --aggie-tint: {AGGIE_TINT};
+        --uc-font: "Montserrat", "Helvetica Neue", Arial, sans-serif;
+    }}
+
+    /* Font: everything except Streamlit's icon glyphs */
+    html, body, .stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp textarea,
+    .stApp select, .stApp button, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5,
+    .stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stMetric"] *,
+    .stApp [data-testid="stCaptionContainer"], .stApp [data-baseweb] {{
+        font-family: var(--uc-font) !important;
+    }}
+    .stApp [data-testid="stIconMaterial"], .stApp .material-icons, .stApp [class*="material-symbols"] {{
+        font-family: "Material Symbols Rounded", "Material Icons" !important;
+    }}
+
+    /* Headings and accents */
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5 {{ color: var(--aggie-blue); font-weight: 700; }}
+    .stApp a {{ color: #266BAC; }}
+
+    /* Sidebar */
+    [data-testid="stSidebar"] {{
+        background: var(--aggie-tint);
+        border-right: 3px solid var(--aggie-gold);
+    }}
+
+    /* Metrics */
+    [data-testid="stMetric"] {{
+        background: #ffffff;
+        border: 1px solid #d7dee8;
+        border-top: 3px solid var(--aggie-gold);
+        border-radius: 8px;
+        padding: 0.6rem 0.9rem;
+    }}
+    [data-testid="stMetricValue"] {{ color: var(--aggie-blue); font-weight: 700; }}
+    [data-testid="stMetricLabel"] {{ color: #4a5a70; }}
+
+    /* Buttons: blue, gold on hover */
+    .stApp button[kind="primary"], .stApp [data-testid="stBaseButton-primary"],
+    .stApp [data-testid="stDownloadButton"] button {{
+        background-color: var(--aggie-blue);
+        border: 1px solid var(--aggie-blue);
+        color: #ffffff;
+        font-weight: 600;
+    }}
+    .stApp button[kind="primary"]:hover, .stApp [data-testid="stBaseButton-primary"]:hover,
+    .stApp [data-testid="stDownloadButton"] button:hover {{
+        background-color: var(--aggie-gold);
+        border-color: var(--aggie-gold);
+        color: var(--aggie-blue);
+    }}
+    .stApp [data-testid="stBaseButton-secondary"]:hover {{
+        border-color: var(--aggie-blue);
+        color: var(--aggie-blue);
+    }}
+
+    /* Expanders and dividers */
+    [data-testid="stExpander"] {{ border: 1px solid #d7dee8; border-radius: 8px; }}
+    [data-testid="stExpander"] summary {{ color: var(--aggie-blue); font-weight: 600; }}
+    hr {{ border-color: #d7dee8; }}
+
+    /* Banner */
+    .uc-banner {{
+        padding: 1rem 1.4rem;
+        border-radius: 10px;
+        background: var(--aggie-blue);
+        color: #ffffff;
+        border-bottom: 5px solid var(--aggie-gold);
+        margin-bottom: 1rem;
+    }}
+    .uc-banner .uc-title {{ font-size: 1.4rem; font-weight: 700; letter-spacing: 0.01em; }}
+    .uc-banner .uc-sub {{ opacity: 0.88; margin-top: 0.2rem; font-size: 0.9rem; }}
+    .uc-banner .uc-kicker {{
+        color: var(--aggie-gold); font-size: 0.75rem; font-weight: 700;
+        letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 0.15rem;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 # -----------------------------
 # SETTINGS
 # -----------------------------
@@ -1486,10 +1585,11 @@ def build_339_zip(df_filtered: pd.DataFrame, split_col: str, row_fields: list, d
 # -----------------------------
 st.markdown(
     """
-    <div style="padding: 0.85rem 1.25rem; border-radius: 12px; background: #01223d; color: white; margin-bottom: 0.75rem;">
-      <div style="font-size: 1.25rem; font-weight: 700;">🐄 Yellow Cluster • Budget Report Generator</div>
-      <div style="opacity: 0.85; margin-top: 0.15rem; font-size: 0.9rem;">
-        Generate PI-level budget reports from a PPM (Aggie Enterprise) export, or build a GL expenses table.
+    <div class="uc-banner">
+      <div class="uc-kicker">UC Davis &nbsp;•&nbsp; Yellow Cluster Administration</div>
+      <div class="uc-title">Budget Report Generator</div>
+      <div class="uc-sub">
+        Generate PI-level budget reports from a PPM (Aggie Enterprise) export, or build GL, 391, GLIDE and 339 reports.
         &nbsp;·&nbsp; Bugs to David Railton Garrett — drgarrett@ucdavis.edu
       </div>
     </div>
