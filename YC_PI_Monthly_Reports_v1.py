@@ -1610,6 +1610,44 @@ def build_339_zip(df_filtered: pd.DataFrame, split_col: str, row_fields: list, d
     return zip_buf.getvalue()
 
 
+
+# -----------------------------
+# SALARY TRANSFER CALCULATOR
+# -----------------------------
+from decimal import Decimal, ROUND_HALF_UP
+
+
+def _cents(x: Decimal) -> Decimal:
+    return x.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def compute_salary_transfer(salary, cbr_pct, idr_from_pct, idr_to_pct) -> dict:
+    """
+    Cost of a salary transfer.
+      Fringe/CBR amount = Salary x CBR
+      Base              = Salary + Salary x CBR
+      Total             = Base + Base x IDR      (once with the source account's IDR, once with the destination's)
+    Percentages are given as whole percents (e.g. 54.5 means 54.5%). Each line is rounded to the cent.
+    """
+    d = lambda v: Decimal(str(v or 0))
+    salary = d(salary)
+    cbr = d(cbr_pct) / 100
+    cbr_amt = _cents(salary * cbr)
+    base = salary + cbr_amt
+
+    def side(idr_pct):
+        idr_amt = _cents(base * d(idr_pct) / 100)
+        return {"idr_amount": idr_amt, "total": base + idr_amt}
+
+    return {
+        "salary": _cents(salary),
+        "cbr_amount": cbr_amt,
+        "base": _cents(base),
+        "from": side(idr_from_pct),
+        "to": side(idr_to_pct),
+    }
+
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -1632,6 +1670,7 @@ GL_OPTION = "GL (YTD Expense Table)"
 R391_OPTION = "391 (Funding Entry Report)"
 GLIDE_OPTION = "GLIDE & Project Costs"
 R339_OPTION = "339 Pivot Generator"
+STX_OPTION = "Salary Transfer Calculator"
 
 # -----------------------------
 # Sidebar: setup / inputs
@@ -1640,12 +1679,13 @@ with st.sidebar:
     st.markdown("#### Setup")
     db_type = st.radio(
         "Database type",
-        options=[PPM_OPTION, GL_OPTION, R391_OPTION, GLIDE_OPTION, R339_OPTION],
+        options=[PPM_OPTION, GL_OPTION, R391_OPTION, GLIDE_OPTION, R339_OPTION, STX_OPTION],
         index=0,
         help=(
             "PPM = Aggie Enterprise (PPM export). GL = General Ledger export. "
             "391 = UCPath Funding Entry Report. GLIDE = GLIDE transaction export. "
-            "339 = Distribution of Payroll Expense Report."
+            "339 = Distribution of Payroll Expense Report. "
+            "Salary Transfer Calculator = true cost of a salary transfer (no file needed)."
         ),
     )
     uploader_labels = {
@@ -1655,7 +1695,7 @@ with st.sidebar:
         GLIDE_OPTION: "GLIDE database (.xlsx)",
         R339_OPTION: "339 database (.xlsx)",
     }
-    db_file = st.file_uploader(uploader_labels[db_type], type=["xlsx"])
+    db_file = None if db_type == STX_OPTION else st.file_uploader(uploader_labels[db_type], type=["xlsx"])
 
     award_file = None
     hide_indirect_in_output = True
@@ -1721,6 +1761,50 @@ with st.sidebar:
                 r339_df_trimmed = None
                 r339_sidebar_msg = f"Could not read the 339 file: {_e339}"
                 st.error(r339_sidebar_msg)
+
+if db_type == STX_OPTION:
+    st.markdown("#### Salary transfer calculator")
+    st.caption(
+        "True cost of a salary transfer: Salary + CBR, then the IDR of each account. "
+        "Enter percentages as whole numbers (for example 54.5 for 54.5%)."
+    )
+
+    col_in, col_out = st.columns([2, 3])
+    with col_in:
+        stx_salary = st.number_input("Salary to transfer ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f", key="stx_salary")
+        stx_cbr = st.number_input("CBR rate (%)", min_value=0.0, max_value=200.0, value=0.0, step=0.1, format="%.2f", key="stx_cbr")
+        stx_idr_from = st.number_input("IDR rate, transferring-from account (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.1, format="%.2f", key="stx_idr_from")
+        stx_diff = st.checkbox("Destination account has a different IDR rate", value=False, key="stx_diff")
+        if stx_diff:
+            stx_idr_to = st.number_input("IDR rate, transferring-to account (%)", min_value=0.0, max_value=100.0, value=float(stx_idr_from), step=0.1, format="%.2f", key="stx_idr_to")
+        else:
+            stx_idr_to = stx_idr_from
+
+    res = compute_salary_transfer(stx_salary, stx_cbr, stx_idr_from, stx_idr_to)
+    money = lambda v: f"${v:,.2f}"
+
+    with col_out:
+        m1, m2 = st.columns(2)
+        m1.metric("Total transferred FROM first account", money(res["from"]["total"]))
+        m2.metric("Total transferred TO second account", money(res["to"]["total"]))
+        if res["from"]["total"] != res["to"]["total"]:
+            gap = res["to"]["total"] - res["from"]["total"]
+            st.caption(f"Difference (to − from): {'+' if gap > 0 else '−'}{money(abs(gap))}, from the IDR rates differing.")
+
+        breakdown = pd.DataFrame(
+            [
+                ["Salary", money(res["salary"]), money(res["salary"])],
+                [f"CBR ({stx_cbr:g}%)", money(res["cbr_amount"]), money(res["cbr_amount"])],
+                ["Salary + CBR", money(res["base"]), money(res["base"])],
+                [f"IDR ({stx_idr_from:g}% from / {stx_idr_to:g}% to)", money(res["from"]["idr_amount"]), money(res["to"]["idr_amount"])],
+                ["Total", money(res["from"]["total"]), money(res["to"]["total"])],
+            ],
+            columns=["", "From account", "To account"],
+        )
+        st.dataframe(breakdown, hide_index=True, use_container_width=True)
+
+    st.caption("Total = (Salary + Salary × CBR) + (Salary + Salary × CBR) × IDR. Each line is rounded to the cent.")
+    st.stop()
 
 if not db_file:
     st.info(
