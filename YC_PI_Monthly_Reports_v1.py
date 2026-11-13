@@ -1648,6 +1648,35 @@ def compute_salary_transfer(salary, cbr_pct, idr_from_pct, idr_to_pct) -> dict:
     }
 
 
+
+def compute_salary_for_total(target_total, cbr_pct, idr_from_pct, idr_to_pct, basis: str = "from") -> dict:
+    """
+    Reverse of compute_salary_transfer: the salary that produces `target_total` on the chosen side
+    (basis = "from" uses the source account's IDR, "to" the destination's).
+      Salary = Total / ((1 + CBR) x (1 + IDR))
+    Salary is a whole-cent amount, so the exact answer is nudged by up to +/- 5 cents to find a salary whose
+    forward total lands exactly on the target (not always possible, because the totals move in steps larger
+    than one cent when CBR x (1 + IDR) > 1). Returns the forward calculation for the chosen salary.
+    """
+    d = lambda v: Decimal(str(v or 0))
+    target = _cents(d(target_total))
+    factor = (1 + d(cbr_pct) / 100) * (1 + d(idr_from_pct if basis == "from" else idr_to_pct) / 100)
+    exact = _cents(target / factor) if factor else Decimal("0")
+
+    best, best_gap = None, None
+    for step in range(-5, 6):
+        cand = exact + Decimal(step) / 100
+        if cand < 0:
+            continue
+        res = compute_salary_transfer(cand, cbr_pct, idr_from_pct, idr_to_pct)
+        gap = abs(res[basis]["total"] - target)
+        if best is None or gap < best_gap or (gap == best_gap and abs(step) < abs(best_step)):
+            best, best_gap, best_step = res, gap, step
+    best["target"] = target
+    best["target_gap"] = best_gap
+    return best
+
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -1764,14 +1793,26 @@ with st.sidebar:
 
 if db_type == STX_OPTION:
     st.markdown("#### Salary transfer calculator")
+    stx_mode = st.radio(
+        "Calculate",
+        options=["Total from salary", "Salary from total"],
+        horizontal=True,
+        key="stx_mode",
+        help="Total from salary: enter a salary, get the total each account is charged. "
+             "Salary from total: enter the total you want moved, get the salary to transfer.",
+    )
+    reverse = stx_mode == "Salary from total"
     st.caption(
-        "True cost of a salary transfer: Salary + CBR, then the IDR of each account. "
+        "Total = (Salary + Salary × CBR) + (Salary + Salary × CBR) × IDR. "
         "Enter percentages as whole numbers (for example 54.5 for 54.5%)."
     )
 
     col_in, col_out = st.columns([2, 3])
     with col_in:
-        stx_salary = st.number_input("Salary to transfer ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f", key="stx_salary")
+        if reverse:
+            stx_target = st.number_input("Total amount to move ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f", key="stx_target")
+        else:
+            stx_salary = st.number_input("Salary to transfer ($)", min_value=0.0, value=0.0, step=100.0, format="%.2f", key="stx_salary")
         stx_cbr = st.number_input("CBR rate (%)", min_value=0.0, max_value=200.0, value=0.0, step=0.1, format="%.2f", key="stx_cbr")
         stx_idr_from = st.number_input("IDR rate, transferring-from account (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.1, format="%.2f", key="stx_idr_from")
         stx_diff = st.checkbox("Destination account has a different IDR rate", value=False, key="stx_diff")
@@ -1779,11 +1820,30 @@ if db_type == STX_OPTION:
             stx_idr_to = st.number_input("IDR rate, transferring-to account (%)", min_value=0.0, max_value=100.0, value=float(stx_idr_from), step=0.1, format="%.2f", key="stx_idr_to")
         else:
             stx_idr_to = stx_idr_from
+        stx_basis = "from"
+        if reverse and stx_diff:
+            _basis_label = st.radio(
+                "The total above is the amount charged to the…",
+                options=["From account", "To account"],
+                horizontal=True,
+                key="stx_basis",
+            )
+            stx_basis = "from" if _basis_label == "From account" else "to"
 
-    res = compute_salary_transfer(stx_salary, stx_cbr, stx_idr_from, stx_idr_to)
+    if reverse:
+        res = compute_salary_for_total(stx_target, stx_cbr, stx_idr_from, stx_idr_to, basis=stx_basis)
+    else:
+        res = compute_salary_transfer(stx_salary, stx_cbr, stx_idr_from, stx_idr_to)
     money = lambda v: f"${v:,.2f}"
 
     with col_out:
+        if reverse:
+            st.metric("Salary to transfer", money(res["salary"]))
+            if res["target_gap"] != 0:
+                st.caption(
+                    f"No whole-cent salary hits {money(res['target'])} exactly; this is the closest "
+                    f"(off by {money(res['target_gap'])})."
+                )
         m1, m2 = st.columns(2)
         m1.metric("Total transferred FROM first account", money(res["from"]["total"]))
         m2.metric("Total transferred TO second account", money(res["to"]["total"]))
@@ -1803,7 +1863,7 @@ if db_type == STX_OPTION:
         )
         st.dataframe(breakdown, hide_index=True, use_container_width=True)
 
-    st.caption("Total = (Salary + Salary × CBR) + (Salary + Salary × CBR) × IDR. Each line is rounded to the cent.")
+    st.caption("Each line is rounded to the cent.")
     st.stop()
 
 if not db_file:
